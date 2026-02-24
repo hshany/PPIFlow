@@ -46,13 +46,13 @@ flowpacker_log="$output_flowpacker_base/logs"
 mkdir -p "$flowpacker_input_pdb_batch" "$output_dir_yml" "$output_dir_flowpacker" "$flowpacker_log"
 
 # Step 1: Split batch
-/lustre/grp/cmclab/share/anaconda3/envs/jaxaf2/bin/python $REPO/1-split_batch.py \
+python $REPO/1-split_batch.py \
   --base_path "$input_pdb_dir" \
   --output_folder_base "$flowpacker_input_pdb_batch" \
   --num_of_jobs "$num_of_jobs"
 
 # Step 2: Write batch folder to batch yml
-/lustre/grp/cmclab/share/anaconda3/envs/jaxaf2/bin/python $REPO/2-run_flowpacker.py \
+python $REPO/2-run_flowpacker.py \
   --base_pdb_path "$flowpacker_input_pdb_batch" \
   --output_yaml_dir "$output_dir_yml" \
 
@@ -131,7 +131,7 @@ mkdir -p "$af3_input_batch" "$output_dir_cif" "$output_dir_jax"  "$output_dir_js
 
 # Step 1: get seq, json and split batch by length
 echo "Step 1: get seq, json and split batch by length"
-/lustre/grp/cmclab/share/anaconda3/envs/jaxaf2/bin/python $REPO/4.1-prepare_get_json.py \
+python $REPO/4.1-prepare_get_json.py \
       --input_dir "$output_dir_flowpacker/run_1" \
       --output_dir_cif "$output_dir_cif" \
       --save_csv "$save_csv" \

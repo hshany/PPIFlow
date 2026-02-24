@@ -266,7 +266,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pdb_folder', type=str, required=True, help='输入PDB文件夹路径')
     parser.add_argument('--output_folder', type=str, required=True, help='输出h5文件夹路径')
-    parser.add_argument('--num_workers', type=int, default=8, help='使用的并行进程数（默认CPU数-2）')
+    parser.add_argument('--num_workers', type=int, default=1, help='使用的并行进程数（默认1，避免 GPU 内存冲突）')
     args = parser.parse_args()
 
     pdb_folder = args.pdb_folder
@@ -288,5 +288,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 
