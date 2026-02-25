@@ -13,12 +13,21 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, TextIO, Tuple
 
 import yaml
 
 
-STEP_NAMES = ("partial_flow", "seq_design", "prep", "flowpacker", "af3score")
+STEP_NAMES = (
+    "partial_flow",
+    "seq_design",
+    "prep",
+    "flowpacker",
+    "af3score",
+    "rosetta_relax",
+    "af3_refold",
+)
+DEFAULT_ENABLED_STEPS = {"partial_flow", "seq_design", "prep", "flowpacker", "af3score"}
 
 
 class PipelineError(Exception):
@@ -137,6 +146,102 @@ class DerivedPaths:
     def af3_base_out(self) -> Path:
         return self.af_root / "af3score_base_outputs"
 
+    @property
+    def af3_filtered_dir(self) -> Path:
+        return self.af_root / "filtered_links"
+
+    @property
+    def af3_filtered_summary(self) -> Path:
+        return self.af3_filtered_dir / "af3score_filtered.csv"
+
+    @property
+    def rosetta_root(self) -> Path:
+        return self.run_root / "rosetta_relax"
+
+    @property
+    def rosetta_inputs_csv(self) -> Path:
+        return self.rosetta_root / "rosetta_inputs.csv"
+
+    @property
+    def rosetta_results_dir(self) -> Path:
+        return self.rosetta_root / "rst_itf_nofix"
+
+    @property
+    def rosetta_filtered_dir(self) -> Path:
+        return self.rosetta_root / "filtered_links"
+
+    @property
+    def rosetta_filtered_summary(self) -> Path:
+        return self.rosetta_filtered_dir / "rosetta_filtered.csv"
+
+    @property
+    def af3_refold_root(self) -> Path:
+        return self.run_root / "af3_refold"
+
+    @property
+    def af3_refold_base_out(self) -> Path:
+        return self.af3_refold_root / "af3_refold_base_outputs"
+
+    @property
+    def af3_refold_single_seq_csv(self) -> Path:
+        return self.af3_refold_base_out / "single_seq.csv"
+
+    @property
+    def af3_refold_input_batch(self) -> Path:
+        return self.af3_refold_base_out / "af3_input_batch"
+
+    @property
+    def af3_refold_cif_dir(self) -> Path:
+        return self.af3_refold_base_out / "single_chain_cif"
+
+    @property
+    def af3_refold_json_dir(self) -> Path:
+        return self.af3_refold_base_out / "json"
+
+    @property
+    def af3_refold_jax_dir(self) -> Path:
+        return self.af3_refold_input_batch / "jax"
+
+    @property
+    def af3_refold_out_dir(self) -> Path:
+        return self.af3_refold_base_out / "af3score_outputs"
+
+    @property
+    def af3_refold_metrics(self) -> Path:
+        return self.af3_refold_base_out / "af3_refold_metrics.csv"
+
+    @property
+    def af3_refold_pdb_models(self) -> Path:
+        return self.af3_refold_root / "pdb_models"
+
+    @property
+    def af3_refold_filtered_dir(self) -> Path:
+        return self.af3_refold_root / "filtered_links"
+
+    @property
+    def af3_refold_filtered_summary(self) -> Path:
+        return self.af3_refold_filtered_dir / "af3_refold_filtered.csv"
+
+    @property
+    def dockq_root(self) -> Path:
+        return self.run_root / "dockq"
+
+    @property
+    def dockq_results_dir(self) -> Path:
+        return self.dockq_root / "results"
+
+    @property
+    def dockq_summary_csv(self) -> Path:
+        return self.dockq_results_dir / "summary_dockq_scores.csv"
+
+    @property
+    def final_hits_dir(self) -> Path:
+        return self.run_root / "final_hits"
+
+    @property
+    def final_hits_csv(self) -> Path:
+        return self.final_hits_dir / "dockq_filtered.csv"
+
 
 def to_path(value: str, base_dir: Path) -> Path:
     path = Path(value).expanduser()
@@ -154,6 +259,7 @@ def run_command(
     *,
     cwd: Optional[Path] = None,
     dry_run: bool = False,
+    stdout: Optional[TextIO] = None,
 ):
     quoted = " ".join(shlex.quote(part) for part in cmd)
     if cwd:
@@ -162,7 +268,7 @@ def run_command(
         log(f"$ {quoted}")
     if dry_run:
         return
-    subprocess.run(cmd, check=True, cwd=cwd)
+    subprocess.run(cmd, check=True, cwd=cwd, stdout=stdout)
 
 
 def conda_cmd(env_name: str, command: Iterable[str]) -> List[str]:
@@ -379,6 +485,48 @@ def swap_chains(input_dir: Path, output_dir: Path):
                 line = f"{line[:21]}{chain}{line[22:]}"
             new_lines.append(line)
         dst.write_text("\n".join(new_lines) + "\n")
+
+
+def safe_symlink(src: Path, dst: Path):
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    os.symlink(src, dst)
+
+
+def filter_metrics_by_threshold(
+    csv_path: Path, iptm_min: float, ptm_min: float
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    ensure_file(csv_path, f"metrics CSV {csv_path.name}")
+    filtered: List[Dict[str, str]] = []
+    fieldnames: List[str] = []
+    with csv_path.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames:
+            fieldnames = list(reader.fieldnames)
+        for row in reader:
+            try:
+                iptm = float(row.get("iptm", "nan"))
+                ptm = float(row.get("ptm_A", "nan"))
+            except (TypeError, ValueError):
+                continue
+            if iptm >= iptm_min and ptm >= ptm_min:
+                filtered.append(row)
+    return filtered, fieldnames
+
+
+def write_summary_csv(
+    path: Path, fieldnames: List[str], rows: List[Dict[str, str]], *, dry_run: bool
+):
+    if dry_run:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not fieldnames and rows:
+        fieldnames = list(rows[0].keys())
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def run_flowpacker(
@@ -607,6 +755,486 @@ def run_af3score(
     log(f"AF3Score metrics written to {af3_metrics}")
 
 
+def filter_af3score_outputs(
+    paths: DerivedPaths, iptm_min: float, ptm_min: float, *, dry_run: bool
+) -> List[str]:
+    metrics = paths.af3_base_out / "af3score_metrics.csv"
+    flowpacker_dir = paths.flowpacker_root / "flowpacker_outputs" / "run_1"
+    ensure_file(metrics, "AF3Score metrics CSV")
+    ensure_dir(flowpacker_dir, "FlowPacker outputs (run_1)")
+    filtered, fieldnames = filter_metrics_by_threshold(metrics, iptm_min, ptm_min)
+    log(
+        f"{len(filtered)} designs pass AF3Score thresholds iptm>= {iptm_min} & ptm>= {ptm_min}"
+    )
+    if not filtered:
+        return []
+    out_dir = paths.af3_filtered_dir
+    summary = paths.af3_filtered_summary
+    write_summary_csv(summary, fieldnames, filtered, dry_run=dry_run)
+    if dry_run:
+        return [row.get("description", "") for row in filtered if row.get("description")]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for existing in out_dir.glob("*.pdb"):
+        existing.unlink()
+    linked: List[str] = []
+    for row in filtered:
+        desc = row.get("description")
+        if not desc:
+            continue
+        src = flowpacker_dir / f"{desc}.pdb"
+        if not src.exists():
+            log(f"[pipeline] WARNING: Missing FlowPacker PDB for {desc}, skipping")
+            continue
+        dst = out_dir / f"{desc}.pdb"
+        safe_symlink(src.resolve(), dst)
+        linked.append(desc)
+    log(f"Linked {len(linked)} AF3Score-filtered complexes into {out_dir}")
+    return linked
+
+
+def filter_rosetta_outputs(
+    paths: DerivedPaths, interface_max: float, *, dry_run: bool
+) -> List[str]:
+    result_dir = paths.rosetta_results_dir
+    ensure_dir(result_dir, "Rosetta results directory")
+    csv_files = sorted(result_dir.glob("rosetta_complex_*.csv"))
+    if not csv_files:
+        raise PipelineError(f"No Rosetta score CSVs found in {result_dir}")
+    filtered_rows: List[Dict[str, str]] = []
+    fieldnames: List[str] = []
+    for csv_file in csv_files:
+        with csv_file.open("r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames and not fieldnames:
+                fieldnames = list(reader.fieldnames)
+            for row in reader:
+                try:
+                    score = float(row.get("interface_score", "nan"))
+                except (TypeError, ValueError):
+                    continue
+                if score <= interface_max:
+                    filtered_rows.append(row)
+    log(
+        f"{len(filtered_rows)} complexes pass Rosetta interface_score <= {interface_max}"
+    )
+    write_summary_csv(
+        paths.rosetta_filtered_summary, fieldnames, filtered_rows, dry_run=dry_run
+    )
+    if dry_run or not filtered_rows:
+        return [row.get("pdb_name", "") for row in filtered_rows if row.get("pdb_name")]
+    filtered_dir = paths.rosetta_filtered_dir
+    filtered_dir.mkdir(parents=True, exist_ok=True)
+    for existing in filtered_dir.glob("*.pdb"):
+        existing.unlink()
+    kept: List[str] = []
+    for row in filtered_rows:
+        pdb_name = row.get("pdb_name")
+        if not pdb_name:
+            continue
+        src = result_dir / f"relax_{pdb_name}.pdb"
+        if not src.exists():
+            log(f"[pipeline] WARNING: Missing relaxed PDB for {pdb_name}")
+            continue
+        dst = filtered_dir / f"{pdb_name}.pdb"
+        safe_symlink(src.resolve(), dst)
+        kept.append(pdb_name)
+    log(f"Linked {len(kept)} Rosetta-filtered complexes into {filtered_dir}")
+    return kept
+
+
+def run_rosetta_relax(
+    repo_root: Path,
+    cfg: Dict,
+    inputs: InputConfig,
+    paths: DerivedPaths,
+    *,
+    dry_run: bool,
+):
+    filter_cfg = cfg.get("af3_filter", {})
+    iptm_min = float(filter_cfg.get("iptm_min", 0.6))
+    ptm_min = float(filter_cfg.get("ptm_min", 0.6))
+    filtered = filter_af3score_outputs(paths, iptm_min, ptm_min, dry_run=dry_run)
+    if not filtered:
+        raise PipelineError(
+            "No AF3Score entries pass the configured thresholds; unable to run Rosetta"
+        )
+    ensure_dir(paths.af3_filtered_dir, "AF3Score-filtered complexes")
+    pdb_files = sorted(paths.af3_filtered_dir.glob("*.pdb"))
+    if not pdb_files:
+        raise PipelineError(
+            f"No filtered AF3Score PDBs found in {paths.af3_filtered_dir}"
+        )
+    rosetta_script = repo_root / "demo_scripts" / "relax_complex.py"
+    ensure_file(rosetta_script, "relax_complex.py")
+    ligand_chain = str(cfg.get("ligand_chain", inputs.binder_chain))
+    receptor_chain = str(cfg.get("receptor_chain", inputs.receptor_chain))
+    fixed_chain = str(cfg.get("fixed_chain", receptor_chain))
+    relax_flag = str(cfg.get("relax", True))
+    fix_backbone = str(cfg.get("fix_backbone", False))
+    max_iter = str(cfg.get("max_iter", 170))
+    if not dry_run:
+        paths.rosetta_root.mkdir(parents=True, exist_ok=True)
+        if paths.rosetta_results_dir.exists():
+            shutil.rmtree(paths.rosetta_results_dir)
+        if paths.rosetta_filtered_dir.exists():
+            shutil.rmtree(paths.rosetta_filtered_dir)
+        paths.rosetta_results_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = paths.rosetta_inputs_csv
+    rows = [
+        {"pdb": str(pdb.resolve()), "ligand": ligand_chain, "receptor": receptor_chain}
+        for pdb in pdb_files
+    ]
+    if dry_run:
+        log(f"Would write Rosetta input CSV with {len(rows)} entries to {csv_path}")
+    else:
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["pdb", "ligand", "receptor"])
+            writer.writeheader()
+            writer.writerows(rows)
+    interface_max = float(cfg.get("interface_score_max", -8.0))
+    if dry_run:
+        log("Would run PyRosetta relax/interface analysis and filter results")
+        return
+    cmd = conda_cmd(
+        cfg["conda_env"],
+        [
+            "python",
+            str(rosetta_script),
+            "--csv_path",
+            str(csv_path),
+            "--output_dir",
+            str(paths.rosetta_results_dir),
+            "--dump_pdb",
+            "True",
+            "--batch_idx",
+            "0",
+            "--relax",
+            relax_flag,
+            "--fixbb",
+            fix_backbone,
+            "--fixed_chain",
+            fixed_chain,
+            "--max_iter",
+            max_iter,
+        ],
+    )
+    run_command(cmd, cwd=repo_root, dry_run=False)
+    filter_rosetta_outputs(paths, interface_max, dry_run=False)
+
+
+def convert_cif_outputs_to_pdb(src_root: Path, dst_dir: Path):
+    try:
+        from Bio.PDB import MMCIFParser, PDBIO
+    except ImportError as exc:
+        raise PipelineError(
+            "Biopython is required to convert AF3 outputs to PDB "
+            "(pip install biopython)."
+        ) from exc
+    parser = MMCIFParser(QUIET=True)  # type: ignore[name-defined]
+    io = PDBIO()  # type: ignore[name-defined]
+    converted = 0
+    for complex_dir in sorted(src_root.iterdir()):
+        if not complex_dir.is_dir():
+            continue
+        cif_files = sorted(complex_dir.rglob("*.cif"))
+        if not cif_files:
+            continue
+        cif_path = cif_files[0]
+        try:
+            structure = parser.get_structure(complex_dir.name, str(cif_path))
+            io.set_structure(structure)
+            dst = dst_dir / f"{complex_dir.name}.pdb"
+            io.save(str(dst))
+            converted += 1
+        except Exception as exc:  # pragma: no cover - best effort logging
+            log(f"[pipeline] WARNING: Failed to convert {cif_path}: {exc}")
+    log(f"Converted {converted} mmCIF complexes to PDB in {dst_dir}")
+
+
+def filter_af3_refold_outputs(
+    paths: DerivedPaths, iptm_min: float, ptm_min: float, *, dry_run: bool
+) -> List[str]:
+    metrics = paths.af3_refold_metrics
+    pdb_dir = paths.af3_refold_pdb_models
+    ensure_file(metrics, "AF3 refold metrics CSV")
+    ensure_dir(pdb_dir, "AF3 refold PDB directory")
+    filtered, fieldnames = filter_metrics_by_threshold(metrics, iptm_min, ptm_min)
+    log(
+        f"{len(filtered)} designs pass AF3 refold thresholds iptm>= {iptm_min} & ptm>= {ptm_min}"
+    )
+    write_summary_csv(
+        paths.af3_refold_filtered_summary, fieldnames, filtered, dry_run=dry_run
+    )
+    if dry_run or not filtered:
+        return [row.get("description", "") for row in filtered if row.get("description")]
+    out_dir = paths.af3_refold_filtered_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for existing in out_dir.glob("*.pdb"):
+        existing.unlink()
+    linked: List[str] = []
+    for row in filtered:
+        desc = row.get("description")
+        if not desc:
+            continue
+        src = pdb_dir / f"{desc}.pdb"
+        if not src.exists():
+            log(f"[pipeline] WARNING: Missing AF3 refold PDB for {desc}")
+            continue
+        dst = out_dir / f"{desc}.pdb"
+        safe_symlink(src.resolve(), dst)
+        linked.append(desc)
+    log(f"Linked {len(linked)} AF3 refold-filtered complexes into {out_dir}")
+    return linked
+
+
+def run_dockq_evaluation(
+    repo_root: Path, cfg: Dict, paths: DerivedPaths, *, dry_run: bool
+):
+    dockq_cfg = cfg.get("dockq", {})
+    if not dockq_cfg.get("enabled", True):
+        log("DockQ evaluation disabled in config")
+        return
+    binary = dockq_cfg.get("binary", "DockQ")
+    binary_path = shutil.which(binary)
+    if not binary_path:
+        candidate = Path(binary)
+        if candidate.exists():
+            binary_path = str(candidate.resolve())
+    if not binary_path:
+        raise PipelineError(
+            f"DockQ binary '{binary}' not found. Add it to PATH or configure dockq.binary."
+        )
+    ensure_dir(paths.af3_refold_filtered_dir, "AF3 refold-filtered structures")
+    ensure_dir(paths.rosetta_filtered_dir, "Rosetta-filtered references")
+    parse_script = repo_root / "demo_scripts" / "parse_dockq_scores.py"
+    ensure_file(parse_script, "DockQ summary parser")
+    models = sorted(paths.af3_refold_filtered_dir.glob("*.pdb"))
+    if not models:
+        log("No AF3 refold-filtered models available for DockQ. Skipping evaluation.")
+        return
+    if dry_run:
+        log(
+            f"Would run DockQ on {len(models)} model/reference pairs using {binary_path}"
+        )
+    else:
+        paths.dockq_results_dir.mkdir(parents=True, exist_ok=True)
+    processed = 0
+    for model in models:
+        reference = paths.rosetta_filtered_dir / model.name
+        if not reference.exists():
+            log(f"[pipeline] WARNING: Missing Rosetta reference for {model.name}")
+            continue
+        subdir = paths.dockq_results_dir / model.stem
+        if not dry_run:
+            subdir.mkdir(parents=True, exist_ok=True)
+        out_file = subdir / f"{model.stem}_dockq_score"
+        if out_file.exists():
+            log(f"DockQ output already exists for {model.stem}, skipping")
+            continue
+        if dry_run:
+            processed += 1
+            continue
+        with out_file.open("w", encoding="utf-8") as handle:
+            run_command(
+                [
+                    binary_path,
+                    "--allowed_mismatches",
+                    "10",
+                    str(model),
+                    str(reference),
+                    "--short",
+                ],
+                dry_run=False,
+                stdout=handle,
+            )
+        processed += 1
+    if dry_run:
+        log(f"Would parse DockQ outputs after {processed} planned runs")
+    else:
+        log(f"DockQ finished for {processed} model/reference pairs")
+    cmd_parse = [
+        sys.executable,
+        str(parse_script),
+        str(paths.dockq_results_dir),
+    ]
+    run_command(cmd_parse, cwd=repo_root, dry_run=dry_run)
+    filter_dockq_results(paths, dockq_cfg, dry_run=dry_run)
+
+
+def filter_dockq_results(paths: DerivedPaths, cfg: Dict, *, dry_run: bool):
+    summary = paths.dockq_summary_csv
+    if not summary.exists():
+        log(f"No DockQ summary found at {summary}; skipping DockQ filtering")
+        return
+    dockq_min = float(cfg.get("dockq_min", 0.5))
+    best_scores: Dict[str, float] = {}
+    with summary.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            folder = row.get("FolderName")
+            try:
+                score = float(row.get("Overall_Avg_DockQ", "nan"))
+            except (TypeError, ValueError):
+                continue
+            if not folder:
+                continue
+            current = best_scores.get(folder, float("-inf"))
+            if score > current:
+                best_scores[folder] = score
+    passing = {name: score for name, score in best_scores.items() if score >= dockq_min}
+    log(f"{len(passing)} models pass DockQ >= {dockq_min}")
+    if dry_run:
+        return
+    paths.final_hits_dir.mkdir(parents=True, exist_ok=True)
+    for existing in paths.final_hits_dir.glob("*.pdb"):
+        existing.unlink()
+    with paths.final_hits_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["FolderName", "Overall_Avg_DockQ"])
+        for name, score in sorted(passing.items()):
+            writer.writerow([name, f"{score:.4f}"])
+            src = paths.af3_refold_filtered_dir / f"{name}.pdb"
+            if not src.exists():
+                log(f"[pipeline] WARNING: Missing AF3 refold PDB for {name}")
+                continue
+            dst = paths.final_hits_dir / f"{name}.pdb"
+            safe_symlink(src.resolve(), dst)
+    log(f"Final DockQ-filtered models written to {paths.final_hits_dir}")
+
+
+def run_af3_refold(
+    repo_root: Path,
+    cfg: Dict,
+    paths: DerivedPaths,
+    *,
+    dry_run: bool,
+):
+    ensure_dir(paths.rosetta_filtered_dir, "Rosetta-filtered PDB directory")
+    rosetta_filtered = sorted(paths.rosetta_filtered_dir.glob("*.pdb"))
+    if not rosetta_filtered:
+        raise PipelineError(
+            f"No Rosetta-filtered complexes found in {paths.rosetta_filtered_dir}"
+        )
+    scripts_dir = repo_root / "demo_scripts" / "flowpacker_af3score"
+    prepare_script = scripts_dir / "4.1-prepare_get_json.py"
+    pdb2jax_script = scripts_dir / "4.2_prepare_pdb2jax.py"
+    af3_script = scripts_dir / "run_af3score.py"
+    metrics_script = scripts_dir / "easy_get_metrics.py"
+    for script in (prepare_script, pdb2jax_script, af3_script, metrics_script):
+        ensure_file(script, script.name)
+    if not dry_run:
+        if paths.af3_refold_root.exists():
+            shutil.rmtree(paths.af3_refold_root)
+        if paths.dockq_root.exists():
+            shutil.rmtree(paths.dockq_root)
+        if paths.final_hits_dir.exists():
+            shutil.rmtree(paths.final_hits_dir)
+        paths.af3_refold_base_out.mkdir(parents=True, exist_ok=True)
+        paths.af3_refold_input_batch.mkdir(parents=True, exist_ok=True)
+        paths.af3_refold_cif_dir.mkdir(parents=True, exist_ok=True)
+        paths.af3_refold_json_dir.mkdir(parents=True, exist_ok=True)
+        paths.af3_refold_jax_dir.mkdir(parents=True, exist_ok=True)
+        paths.af3_refold_out_dir.mkdir(parents=True, exist_ok=True)
+        paths.af3_refold_pdb_models.mkdir(parents=True, exist_ok=True)
+        paths.af3_refold_filtered_dir.mkdir(parents=True, exist_ok=True)
+        paths.dockq_results_dir.mkdir(parents=True, exist_ok=True)
+        paths.final_hits_dir.mkdir(parents=True, exist_ok=True)
+    cmd_prepare = conda_cmd(
+        cfg["conda_env"],
+        [
+            "python",
+            str(prepare_script),
+            "--input_dir",
+            str(paths.rosetta_filtered_dir),
+            "--output_dir_cif",
+            str(paths.af3_refold_cif_dir),
+            "--save_csv",
+            str(paths.af3_refold_single_seq_csv),
+            "--output_dir_json",
+            str(paths.af3_refold_json_dir),
+            "--batch_dir",
+            str(paths.af3_refold_input_batch),
+            "--num_jobs",
+            str(cfg.get("num_jobs", 1)),
+        ],
+    )
+    run_command(cmd_prepare, cwd=repo_root, dry_run=dry_run)
+    if dry_run:
+        log("Would build AF3 refold batches, run inference, and evaluate DockQ")
+        return
+    pdb_batches = sorted((paths.af3_refold_input_batch / "pdb").glob("*"))
+    for pdb_batch in pdb_batches:
+        if not pdb_batch.is_dir():
+            continue
+        output_folder = paths.af3_refold_jax_dir / pdb_batch.name
+        output_folder.mkdir(parents=True, exist_ok=True)
+        cmd = conda_cmd(
+            cfg["conda_env"],
+            [
+                "python",
+                str(pdb2jax_script),
+                "--pdb_folder",
+                str(pdb_batch),
+                "--output_folder",
+                str(output_folder),
+            ],
+        )
+        run_command(cmd, cwd=repo_root, dry_run=False)
+    json_batches = sorted((paths.af3_refold_input_batch / "json").glob("*"))
+    db_dir = Path(cfg["db_dir"])
+    model_dir = Path(cfg["model_dir"])
+    ensure_dir(db_dir, "AF3 database dir")
+    ensure_dir(model_dir, "AF3 model dir")
+    for json_batch in json_batches:
+        if not json_batch.is_dir():
+            continue
+        bucket_name = json_batch.name
+        bucket_match = re.search(r"(\d+)$", bucket_name)
+        buckets = bucket_match.group(1) if bucket_match else ""
+        cmd = conda_cmd(
+            cfg["conda_env"],
+            [
+                "python",
+                str(af3_script),
+                f"--db_dir={db_dir}",
+                f"--model_dir={model_dir}",
+                f"--batch_json_dir={json_batch}",
+                f"--batch_h5_dir={paths.af3_refold_jax_dir / bucket_name}",
+                f"--output_dir={paths.af3_refold_out_dir}",
+                "--run_data_pipeline=False",
+                "--run_inference=true",
+                "--init_guess=true",
+                f"--num_samples={cfg.get('num_samples', 1)}",
+                f"--buckets={buckets}",
+                "--write_cif_model=True",
+                "--write_summary_confidences=true",
+                "--write_full_confidences=true",
+                "--write_best_model_root=true",
+                "--write_ranking_scores_csv=true",
+                "--write_terms_of_use_file=false",
+                "--write_fold_input_json_file=false",
+            ],
+        )
+        run_command(cmd, cwd=repo_root, dry_run=False)
+    cmd_metrics = conda_cmd(
+        cfg["conda_env"],
+        [
+            "python",
+            str(metrics_script),
+            str(paths.af3_refold_out_dir),
+            str(paths.af3_refold_metrics),
+        ],
+    )
+    run_command(cmd_metrics, cwd=repo_root, dry_run=False)
+    convert_cif_outputs_to_pdb(paths.af3_refold_out_dir, paths.af3_refold_pdb_models)
+    filter_cfg = cfg.get("filter", {})
+    iptm_min = float(filter_cfg.get("iptm_min", 0.7))
+    ptm_min = float(filter_cfg.get("ptm_min", 0.7))
+    filtered = filter_af3_refold_outputs(paths, iptm_min, ptm_min, dry_run=False)
+    if not filtered:
+        log("No AF3 refold entries passed the thresholds; skipping DockQ.")
+        return
+    run_dockq_evaluation(repo_root, cfg, paths, dry_run=False)
 def main():
     args = parse_args()
     config_path = Path(args.config).expanduser().resolve()
@@ -667,10 +1295,18 @@ def main():
         "af3score": lambda: run_af3score(
             repo_root, step_settings["af3score"], paths, dry_run=dry_run
         ),
+        "rosetta_relax": lambda: run_rosetta_relax(
+            repo_root, step_settings["rosetta_relax"], inputs, paths, dry_run=dry_run
+        ),
+        "af3_refold": lambda: run_af3_refold(
+            repo_root, step_settings["af3_refold"], paths, dry_run=dry_run
+        ),
     }
     for step in STEP_NAMES:
         settings = step_settings[step]
-        enabled = settings.get("enabled", True)
+        enabled = settings.get("enabled")
+        if enabled is None:
+            enabled = step in DEFAULT_ENABLED_STEPS
         env = settings.get("conda_env")
         if not enabled:
             log(f"Skipping {step}: disabled in config")
@@ -678,7 +1314,7 @@ def main():
         if requested_steps and step not in requested_steps:
             log(f"Skipping {step}: not requested")
             continue
-        if step != "prep" and not env:
+        if enabled and step != "prep" and not env:
             raise PipelineError(f"conda_env must be set for step '{step}'")
         marker = marker_path(paths, step)
         if marker.exists() and not args.force:
