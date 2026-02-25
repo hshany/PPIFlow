@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import shlex
@@ -26,6 +27,7 @@ STEP_NAMES = (
     "af3score",
     "rosetta_relax",
     "af3_refold",
+    "dockq",
 )
 DEFAULT_ENABLED_STEPS = {"partial_flow", "seq_design", "prep", "flowpacker", "af3score"}
 
@@ -268,7 +270,22 @@ def run_command(
         log(f"$ {quoted}")
     if dry_run:
         return
-    subprocess.run(cmd, check=True, cwd=cwd, stdout=stdout)
+    if stdout is not None:
+        subprocess.run(cmd, check=True, cwd=cwd, stdout=stdout)
+        return
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="")
+    ret = process.wait()
+    if ret != 0:
+        raise subprocess.CalledProcessError(ret, cmd)
 
 
 def conda_cmd(env_name: str, command: Iterable[str]) -> List[str]:
@@ -954,6 +971,119 @@ def convert_cif_outputs_to_pdb(src_root: Path, dst_dir: Path):
     log(f"Converted {converted} mmCIF complexes to PDB in {dst_dir}")
 
 
+def convert_cif_to_pdb(cif_path: Path, pdb_path: Path):
+    try:
+        from Bio.PDB import MMCIFParser, PDBIO
+    except ImportError as exc:
+        raise PipelineError(
+            "Biopython is required to convert AF3 outputs to PDB "
+            "(pip install biopython)."
+        ) from exc
+    parser = MMCIFParser(QUIET=True)  # type: ignore[name-defined]
+    io = PDBIO()  # type: ignore[name-defined]
+    structure = parser.get_structure(pdb_path.stem, str(cif_path))
+    io.set_structure(structure)
+    pdb_path.parent.mkdir(parents=True, exist_ok=True)
+    io.save(str(pdb_path))
+
+
+def extract_chain_sequence(pdb_path: Path, chain_id: str) -> str:
+    try:
+        from Bio.PDB import PDBParser
+    except ImportError as exc:
+        raise PipelineError(
+            "Biopython is required to extract peptide sequences "
+            "(pip install biopython)."
+        ) from exc
+    protein_letters_3to1 = {
+        "ALA": "A",
+        "CYS": "C",
+        "ASP": "D",
+        "GLU": "E",
+        "PHE": "F",
+        "GLY": "G",
+        "HIS": "H",
+        "ILE": "I",
+        "LYS": "K",
+        "LEU": "L",
+        "MET": "M",
+        "ASN": "N",
+        "PRO": "P",
+        "GLN": "Q",
+        "ARG": "R",
+        "SER": "S",
+        "THR": "T",
+        "VAL": "V",
+        "TRP": "W",
+        "TYR": "Y",
+        "MSE": "M",
+    }
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure(pdb_path.stem, str(pdb_path))
+    if not structure:
+        raise PipelineError(f"Failed to parse PDB: {pdb_path}")
+    try:
+        chain = structure[0][chain_id]
+    except KeyError as exc:
+        raise PipelineError(f"Chain {chain_id} not found in {pdb_path}") from exc
+    sequence = ""
+    for residue in chain:
+        if residue.id[0] == " ":
+            resname = residue.get_resname().upper()
+            sequence += protein_letters_3to1.get(resname, "X")
+    return sequence
+
+
+def _query_only_msa(sequence: str) -> str:
+    return f">query\n{sequence}\n"
+
+
+def write_af3_base_json(
+    output_path: Path,
+    *,
+    name: str,
+    receptor_chain: str,
+    receptor_sequence: str,
+    receptor_msa_path: Path,
+    ligand_chain: str,
+    ligand_sequence: str,
+    model_seeds: Iterable[int],
+):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "dialect": "alphafold3",
+        "version": 1,
+        "name": name,
+        "sequences": [
+            {
+                "protein": {
+                    "id": ligand_chain,
+                    "sequence": ligand_sequence,
+                    "modifications": [],
+                    "unpairedMsa": _query_only_msa(ligand_sequence),
+                    "pairedMsa": _query_only_msa(ligand_sequence),
+                    "templates": [],
+                }
+            },
+            {
+                "protein": {
+                    "id": receptor_chain,
+                    "sequence": receptor_sequence,
+                    "modifications": [],
+                    "unpairedMsaPath": str(receptor_msa_path),
+                    "pairedMsa": _query_only_msa(receptor_sequence),
+                    "templates": [],
+                }
+            },
+        ],
+        "modelSeeds": list(model_seeds),
+        "bondedAtomPairs": None,
+        "userCCD": None,
+    }
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+
+
 def filter_af3_refold_outputs(
     paths: DerivedPaths, iptm_min: float, ptm_min: float, *, dry_run: bool
 ) -> List[str]:
@@ -997,16 +1127,20 @@ def run_dockq_evaluation(
     if not dockq_cfg.get("enabled", True):
         log("DockQ evaluation disabled in config")
         return
+    dockq_env = dockq_cfg.get("conda_env")
     binary = dockq_cfg.get("binary", "DockQ")
-    binary_path = shutil.which(binary)
-    if not binary_path:
-        candidate = Path(binary)
-        if candidate.exists():
-            binary_path = str(candidate.resolve())
-    if not binary_path:
-        raise PipelineError(
-            f"DockQ binary '{binary}' not found. Add it to PATH or configure dockq.binary."
-        )
+    if dockq_env:
+        binary_path = str(Path(binary).resolve()) if Path(binary).exists() else binary
+    else:
+        binary_path = shutil.which(binary)
+        if not binary_path:
+            candidate = Path(binary)
+            if candidate.exists():
+                binary_path = str(candidate.resolve())
+        if not binary_path:
+            raise PipelineError(
+                f"DockQ binary '{binary}' not found. Add it to PATH or configure dockq.binary."
+            )
     ensure_dir(paths.af3_refold_filtered_dir, "AF3 refold-filtered structures")
     ensure_dir(paths.rosetta_filtered_dir, "Rosetta-filtered references")
     parse_script = repo_root / "demo_scripts" / "parse_dockq_scores.py"
@@ -1037,31 +1171,45 @@ def run_dockq_evaluation(
         if dry_run:
             processed += 1
             continue
+        dockq_cmd = [
+            binary_path,
+            "--allowed_mismatches",
+            "10",
+            str(model),
+            str(reference),
+            "--short",
+        ]
+        if dockq_env:
+            dockq_cmd = conda_cmd(dockq_env, dockq_cmd)
         with out_file.open("w", encoding="utf-8") as handle:
-            run_command(
-                [
-                    binary_path,
-                    "--allowed_mismatches",
-                    "10",
-                    str(model),
-                    str(reference),
-                    "--short",
-                ],
-                dry_run=False,
-                stdout=handle,
-            )
+            run_command(dockq_cmd, dry_run=False, stdout=handle)
         processed += 1
     if dry_run:
         log(f"Would parse DockQ outputs after {processed} planned runs")
     else:
         log(f"DockQ finished for {processed} model/reference pairs")
-    cmd_parse = [
-        sys.executable,
-        str(parse_script),
-        str(paths.dockq_results_dir),
-    ]
+    if dockq_env:
+        cmd_parse = conda_cmd(
+            dockq_env,
+            [
+                "python",
+                str(parse_script),
+                str(paths.dockq_results_dir),
+            ],
+        )
+    else:
+        cmd_parse = [
+            sys.executable,
+            str(parse_script),
+            str(paths.dockq_results_dir),
+        ]
     run_command(cmd_parse, cwd=repo_root, dry_run=dry_run)
     filter_dockq_results(paths, dockq_cfg, dry_run=dry_run)
+
+
+def run_dockq_step(repo_root: Path, cfg: Dict, paths: DerivedPaths, *, dry_run: bool):
+    wrapper = {"dockq": cfg}
+    run_dockq_evaluation(repo_root, wrapper, paths, dry_run=dry_run)
 
 
 def filter_dockq_results(paths: DerivedPaths, cfg: Dict, *, dry_run: bool):
@@ -1108,7 +1256,9 @@ def filter_dockq_results(paths: DerivedPaths, cfg: Dict, *, dry_run: bool):
 def run_af3_refold(
     repo_root: Path,
     cfg: Dict,
+    inputs: InputConfig,
     paths: DerivedPaths,
+    rosetta_cfg: Dict,
     *,
     dry_run: bool,
 ):
@@ -1118,13 +1268,17 @@ def run_af3_refold(
         raise PipelineError(
             f"No Rosetta-filtered complexes found in {paths.rosetta_filtered_dir}"
         )
-    scripts_dir = repo_root / "demo_scripts" / "flowpacker_af3score"
-    prepare_script = scripts_dir / "4.1-prepare_get_json.py"
-    pdb2jax_script = scripts_dir / "4.2_prepare_pdb2jax.py"
-    af3_script = scripts_dir / "run_af3score.py"
-    metrics_script = scripts_dir / "easy_get_metrics.py"
-    for script in (prepare_script, pdb2jax_script, af3_script, metrics_script):
-        ensure_file(script, script.name)
+    base_json_value = cfg.get("base_json")
+    if base_json_value:
+        base_json = Path(base_json_value)
+    else:
+        base_json = paths.af3_refold_base_out / "base_json" / "base.json"
+    screen_script_value = cfg.get("peptide_screen_script")
+    if screen_script_value:
+        screen_script = Path(screen_script_value)
+    else:
+        screen_script = repo_root / "myscripts" / "peptide_variant_screen.py"
+    ensure_file(screen_script, "peptide_variant_screen.py")
     if not dry_run:
         if paths.af3_refold_root.exists():
             shutil.rmtree(paths.af3_refold_root)
@@ -1133,110 +1287,143 @@ def run_af3_refold(
         if paths.final_hits_dir.exists():
             shutil.rmtree(paths.final_hits_dir)
         paths.af3_refold_base_out.mkdir(parents=True, exist_ok=True)
-        paths.af3_refold_input_batch.mkdir(parents=True, exist_ok=True)
-        paths.af3_refold_cif_dir.mkdir(parents=True, exist_ok=True)
-        paths.af3_refold_json_dir.mkdir(parents=True, exist_ok=True)
-        paths.af3_refold_jax_dir.mkdir(parents=True, exist_ok=True)
-        paths.af3_refold_out_dir.mkdir(parents=True, exist_ok=True)
         paths.af3_refold_pdb_models.mkdir(parents=True, exist_ok=True)
         paths.af3_refold_filtered_dir.mkdir(parents=True, exist_ok=True)
         paths.dockq_results_dir.mkdir(parents=True, exist_ok=True)
         paths.final_hits_dir.mkdir(parents=True, exist_ok=True)
-    cmd_prepare = conda_cmd(
-        cfg["conda_env"],
-        [
-            "python",
-            str(prepare_script),
-            "--input_dir",
-            str(paths.rosetta_filtered_dir),
-            "--output_dir_cif",
-            str(paths.af3_refold_cif_dir),
-            "--save_csv",
-            str(paths.af3_refold_single_seq_csv),
-            "--output_dir_json",
-            str(paths.af3_refold_json_dir),
-            "--batch_dir",
-            str(paths.af3_refold_input_batch),
-            "--num_jobs",
-            str(cfg.get("num_jobs", 1)),
-        ],
-    )
-    run_command(cmd_prepare, cwd=repo_root, dry_run=dry_run)
+    receptor_chain = str(rosetta_cfg.get("receptor_chain", inputs.receptor_chain))
+    if not base_json_value:
+        if dry_run:
+            log("Would generate base AF3 JSON and receptor MSA from Rosetta-filtered PDBs")
+        else:
+            base_root = paths.af3_refold_base_out / "base_json"
+            if base_root.exists():
+                shutil.rmtree(base_root)
+            base_root.mkdir(parents=True, exist_ok=True)
+            receptor_fasta = base_root / "receptor.fasta"
+            receptor_msa_dir = base_root / "receptor_msa"
+            sequence = extract_chain_sequence(rosetta_filtered[0], receptor_chain)
+            receptor_fasta.write_text(
+                f">receptor_{receptor_chain}\n{sequence}\n", encoding="utf-8"
+            )
+            cmd_msa = conda_cmd(
+                cfg.get("colabfold_env", "colabfold"),
+                [
+                    "colabfold_batch",
+                    str(receptor_fasta),
+                    str(receptor_msa_dir),
+                    "--msa-only",
+                ],
+            )
+            run_command(cmd_msa, cwd=repo_root, dry_run=False)
+            msa_files = sorted(receptor_msa_dir.glob("*.a3m"))
+            if not msa_files:
+                raise PipelineError(f"No MSA files found in {receptor_msa_dir}")
+            ligand_chain = str(rosetta_cfg.get("ligand_chain", inputs.binder_chain))
+            ligand_sequence = extract_chain_sequence(rosetta_filtered[0], ligand_chain)
+            base_json = base_root / "base.json"
+            num_seeds = int(cfg.get("num_seeds", 1))
+            seed_start = int(cfg.get("seed_start", 10))
+            write_af3_base_json(
+                base_json,
+                name=rosetta_filtered[0].stem,
+                receptor_chain=receptor_chain,
+                receptor_sequence=sequence,
+                receptor_msa_path=msa_files[0].resolve(),
+                ligand_chain=ligand_chain,
+                ligand_sequence=ligand_sequence,
+                model_seeds=cfg.get(
+                    "model_seeds", list(range(seed_start, seed_start + num_seeds))
+                ),
+            )
+    ensure_file(base_json, "base AF3 JSON")
+    ligand_chain = str(rosetta_cfg.get("ligand_chain", inputs.binder_chain))
+    peptide_fasta = paths.af3_refold_base_out / "peptide_variants.fa"
     if dry_run:
-        log("Would build AF3 refold batches, run inference, and evaluate DockQ")
-        return
-    pdb_batches = sorted((paths.af3_refold_input_batch / "pdb").glob("*"))
-    for pdb_batch in pdb_batches:
-        if not pdb_batch.is_dir():
-            continue
-        output_folder = paths.af3_refold_jax_dir / pdb_batch.name
-        output_folder.mkdir(parents=True, exist_ok=True)
-        cmd = conda_cmd(
-            cfg["conda_env"],
-            [
-                "python",
-                str(pdb2jax_script),
-                "--pdb_folder",
-                str(pdb_batch),
-                "--output_folder",
-                str(output_folder),
-            ],
-        )
-        run_command(cmd, cwd=repo_root, dry_run=False)
-    json_batches = sorted((paths.af3_refold_input_batch / "json").glob("*"))
-    db_dir = Path(cfg["db_dir"])
+        log(f"Would write peptide FASTA to {peptide_fasta}")
+    else:
+        with peptide_fasta.open("w", encoding="utf-8") as handle:
+            for pdb in rosetta_filtered:
+                sequence = extract_chain_sequence(pdb, ligand_chain)
+                handle.write(f">{pdb.stem}\n{sequence}\n")
     model_dir = Path(cfg["model_dir"])
-    ensure_dir(db_dir, "AF3 database dir")
     ensure_dir(model_dir, "AF3 model dir")
-    for json_batch in json_batches:
-        if not json_batch.is_dir():
-            continue
-        bucket_name = json_batch.name
-        bucket_match = re.search(r"(\d+)$", bucket_name)
-        buckets = bucket_match.group(1) if bucket_match else ""
-        cmd = conda_cmd(
-            cfg["conda_env"],
-            [
-                "python",
-                str(af3_script),
-                f"--db_dir={db_dir}",
-                f"--model_dir={model_dir}",
-                f"--batch_json_dir={json_batch}",
-                f"--batch_h5_dir={paths.af3_refold_jax_dir / bucket_name}",
-                f"--output_dir={paths.af3_refold_out_dir}",
-                "--run_data_pipeline=False",
-                "--run_inference=true",
-                "--init_guess=true",
-                f"--num_samples={cfg.get('num_samples', 1)}",
-                f"--buckets={buckets}",
-                "--write_cif_model=True",
-                "--write_summary_confidences=true",
-                "--write_full_confidences=true",
-                "--write_best_model_root=true",
-                "--write_ranking_scores_csv=true",
-                "--write_terms_of_use_file=false",
-                "--write_fold_input_json_file=false",
-            ],
-        )
-        run_command(cmd, cwd=repo_root, dry_run=False)
-    cmd_metrics = conda_cmd(
+    cmd_screen = conda_cmd(
         cfg["conda_env"],
         [
             "python",
-            str(metrics_script),
-            str(paths.af3_refold_out_dir),
-            str(paths.af3_refold_metrics),
+            str(screen_script),
+            "--json_path",
+            str(base_json),
+            "--peptide_chain_id",
+            ligand_chain,
+            "--peptide_sequences",
+            str(peptide_fasta),
+            "--output_dir",
+            str(paths.af3_refold_base_out),
+            "--model_dir",
+            str(model_dir),
+            "--num_diffusion_samples",
+            str(cfg.get("num_diffusion_samples", 1)),
+            "--num_recycles",
+            str(cfg.get("num_recycles", 3)),
+            "--receptor_chain_id",
+            receptor_chain,
         ],
     )
-    run_command(cmd_metrics, cwd=repo_root, dry_run=False)
-    convert_cif_outputs_to_pdb(paths.af3_refold_out_dir, paths.af3_refold_pdb_models)
+    run_command(cmd_screen, cwd=repo_root, dry_run=dry_run)
+    if dry_run:
+        log("Would filter AF3 refold outputs and evaluate DockQ")
+        return
+    summary_path = paths.af3_refold_base_out / "screening_best_summary.csv"
+    ensure_file(summary_path, "AF3 refold summary CSV")
     filter_cfg = cfg.get("filter", {})
     iptm_min = float(filter_cfg.get("iptm_min", 0.7))
-    ptm_min = float(filter_cfg.get("ptm_min", 0.7))
-    filtered = filter_af3_refold_outputs(paths, iptm_min, ptm_min, dry_run=False)
-    if not filtered:
+    plddt_min = float(filter_cfg.get("plddt_min", 70.0))
+    filtered_rows: List[Dict[str, str]] = []
+    with summary_path.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                iptm = float(row.get("iptm_peptide_vs_receptor", "nan"))
+                plddt = float(row.get("plddt_peptide_mean", "nan"))
+            except (TypeError, ValueError):
+                continue
+            if iptm >= iptm_min and plddt >= plddt_min:
+                filtered_rows.append(row)
+    log(
+        f"{len(filtered_rows)} designs pass AF3 refold thresholds iptm>= {iptm_min} & plddt>= {plddt_min}"
+    )
+    write_summary_csv(
+        paths.af3_refold_filtered_summary,
+        list(filtered_rows[0].keys()) if filtered_rows else [],
+        filtered_rows,
+        dry_run=False,
+    )
+    if not filtered_rows:
         log("No AF3 refold entries passed the thresholds; skipping DockQ.")
         return
+    for existing in paths.af3_refold_pdb_models.glob("*.pdb"):
+        existing.unlink()
+    for existing in paths.af3_refold_filtered_dir.glob("*.pdb"):
+        existing.unlink()
+    linked: List[str] = []
+    for row in filtered_rows:
+        name = row.get("name") or ""
+        variant_dir = row.get("variant_dir")
+        if not name or not variant_dir:
+            continue
+        seed_dir = Path(variant_dir)
+        cif_files = sorted(seed_dir.rglob("*.cif"))
+        if not cif_files:
+            log(f"[pipeline] WARNING: No CIF outputs found for {name} in {seed_dir}")
+            continue
+        dst_pdb = paths.af3_refold_pdb_models / f"{name}.pdb"
+        convert_cif_to_pdb(cif_files[0], dst_pdb)
+        dst_filtered = paths.af3_refold_filtered_dir / f"{name}.pdb"
+        safe_symlink(dst_pdb.resolve(), dst_filtered)
+        linked.append(name)
+    log(f"Linked {len(linked)} AF3 refold-filtered complexes into {paths.af3_refold_filtered_dir}")
     run_dockq_evaluation(repo_root, cfg, paths, dry_run=False)
 def main():
     args = parse_args()
@@ -1282,6 +1469,8 @@ def main():
         requested_steps = list(STEP_NAMES)
     dry_run = args.dry_run
     step_settings = {name: cfg.get(name, {}) for name in STEP_NAMES}
+    if "dockq" in step_settings:
+        step_settings["dockq"] = cfg.get("dockq", cfg.get("af3_refold", {}).get("dockq", {}))
     step_functions = {
         "partial_flow": lambda: run_partial_flow(
             repo_root, step_settings["partial_flow"], inputs, paths, dry_run=dry_run
@@ -1302,7 +1491,18 @@ def main():
             repo_root, step_settings["rosetta_relax"], inputs, paths, dry_run=dry_run
         ),
         "af3_refold": lambda: run_af3_refold(
-            repo_root, step_settings["af3_refold"], paths, dry_run=dry_run
+            repo_root,
+            step_settings["af3_refold"],
+            inputs,
+            paths,
+            step_settings["rosetta_relax"],
+            dry_run=dry_run,
+        ),
+        "dockq": lambda: run_dockq_step(
+            repo_root,
+            step_settings["dockq"],
+            paths,
+            dry_run=dry_run,
         ),
     }
     for step in STEP_NAMES:
@@ -1317,7 +1517,7 @@ def main():
         if requested_steps and step not in requested_steps:
             log(f"Skipping {step}: not requested")
             continue
-        if enabled and step != "prep" and not env:
+        if enabled and step not in ("prep") and not env:
             raise PipelineError(f"conda_env must be set for step '{step}'")
         marker = marker_path(paths, step)
         if marker.exists() and not args.force:
