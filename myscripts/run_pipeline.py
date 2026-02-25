@@ -864,7 +864,7 @@ def run_rosetta_relax(
         raise PipelineError(
             f"No filtered AF3Score PDBs found in {paths.af3_filtered_dir}"
         )
-    rosetta_script = repo_root / "demo_scripts" / "relax_complex.py"
+    rosetta_script = repo_root / "myscripts" / "relax_complex.py"
     ensure_file(rosetta_script, "relax_complex.py")
     ligand_chain = str(cfg.get("ligand_chain", inputs.binder_chain))
     receptor_chain = str(cfg.get("receptor_chain", inputs.receptor_chain))
@@ -895,6 +895,7 @@ def run_rosetta_relax(
     if dry_run:
         log("Would run PyRosetta relax/interface analysis and filter results")
         return
+    num_workers = str(cfg.get("num_workers", 1))
     cmd = conda_cmd(
         cfg["conda_env"],
         [
@@ -916,6 +917,8 @@ def run_rosetta_relax(
             fixed_chain,
             "--max_iter",
             max_iter,
+            "--num_workers",
+            num_workers,
         ],
     )
     run_command(cmd, cwd=repo_root, dry_run=False)
