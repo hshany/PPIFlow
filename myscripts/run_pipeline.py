@@ -22,14 +22,13 @@ import yaml
 STEP_NAMES = (
     "partial_flow",
     "seq_design",
-    "prep",
     "flowpacker",
     "af3score",
     "rosetta_relax",
     "af3_refold",
     "dockq",
 )
-DEFAULT_ENABLED_STEPS = {"partial_flow", "seq_design", "prep", "flowpacker", "af3score"}
+DEFAULT_ENABLED_STEPS = {"partial_flow", "seq_design", "flowpacker", "af3score"}
 
 
 class PipelineError(Exception):
@@ -90,9 +89,10 @@ def resolve_strings(obj, mapping: Dict[str, str]):
 @dataclass
 class InputConfig:
     pdb_path: Path
-    fixed_positions_csv: Path
     receptor_chain: str
     binder_chain: str
+    fixed_positions: str
+    cdr_position: Optional[str] = None
 
 
 @dataclass
@@ -127,6 +127,10 @@ class DerivedPaths:
     @property
     def pf_fa_sum(self) -> Path:
         return self.run_root / "pf_fa_sum.csv"
+
+    @property
+    def fixed_positions_csv(self) -> Path:
+        return self.run_root / "fixed_positions.csv"
 
     @property
     def af_root(self) -> Path:
@@ -310,6 +314,99 @@ def create_marker(path: Path):
 def marker_path(paths: DerivedPaths, step_name: str) -> Path:
     return paths.logs_dir / f".{step_name}.done"
 
+def parse_fixed_positions_map(
+    fixed_positions: str, default_chain: str
+) -> Dict[str, List[int]]:
+    positions: Dict[str, List[int]] = {}
+    if not fixed_positions:
+        return positions
+    for raw_token in fixed_positions.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        match = re.match(
+            r"^(?:(?P<chain>[A-Za-z])\s*)?(?P<start>\d+)(?:\s*-\s*(?P<end>\d+))?$",
+            token,
+        )
+        if not match:
+            log(f"WARNING: Skipping invalid fixed_positions token '{token}'")
+            continue
+        chain = match.group("chain") or default_chain
+        start = int(match.group("start"))
+        end = int(match.group("end") or start)
+        if end < start:
+            log(f"WARNING: Skipping reversed fixed_positions range '{token}'")
+            continue
+        positions.setdefault(chain, []).extend(range(start, end + 1))
+    for chain_id, values in positions.items():
+        positions[chain_id] = sorted(set(values))
+    return positions
+
+
+def build_fixed_positions_csv(
+    paths: DerivedPaths,
+    pdb_stems: List[str],
+    chain_list: str,
+    chain_order: List[str],
+    fixed_positions: str,
+    *,
+    default_chain: str,
+    dry_run: bool,
+) -> Path:
+    chain_ids = [item for item in chain_list.split() if item]
+    if not chain_ids:
+        raise PipelineError("seq_design.chain_list must be provided when using fixed_positions")
+    positions_map = parse_fixed_positions_map(fixed_positions, default_chain)
+    if not positions_map:
+        raise PipelineError("No valid fixed_positions entries were parsed")
+    if not chain_order:
+        raise PipelineError("Unable to determine chain order for fixed_positions CSV")
+    chain_chunks: List[str] = []
+    fallback_positions: Optional[List[int]] = None
+    if len(chain_ids) == 1 and positions_map:
+        fallback_positions = next(iter(positions_map.values()))
+    for chain_id in chain_order:
+        nums = positions_map.get(chain_id, [])
+        if not nums and chain_id in chain_ids and fallback_positions:
+            nums = fallback_positions
+            log(
+                "WARNING: Mapping fixed_positions to designed chain "
+                f"{chain_id} (no explicit positions for this chain)"
+            )
+        chain_chunks.append(" ".join(str(num) for num in nums))
+    positions_str = " - ".join(chain_chunks)
+    if dry_run:
+        log(f"Would write fixed positions CSV to {paths.fixed_positions_csv}")
+        return paths.fixed_positions_csv
+    paths.fixed_positions_csv.parent.mkdir(parents=True, exist_ok=True)
+    with paths.fixed_positions_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["PDB_ID", "fixed_positions"])
+        for pdb_id in pdb_stems:
+            writer.writerow([pdb_id, positions_str])
+    return paths.fixed_positions_csv
+
+
+def positions_to_contig(chain_id: str, positions: List[int]) -> str:
+    if not positions:
+        return ""
+    segments: List[Tuple[int, int]] = []
+    start = prev = positions[0]
+    for pos in positions[1:]:
+        if pos == prev + 1:
+            prev = pos
+            continue
+        segments.append((start, prev))
+        start = prev = pos
+    segments.append((start, prev))
+    parts = []
+    for start, end in segments:
+        if start == end:
+            parts.append(f"{chain_id}{start}")
+        else:
+            parts.append(f"{chain_id}{start}-{end}")
+    return ",".join(parts)
+
 
 def run_partial_flow(
     repo_root: Path,
@@ -330,11 +427,26 @@ def run_partial_flow(
     ensure_file(config_path, "partial flow config")
     out_root = paths.partial_output_root
     out_root.mkdir(parents=True, exist_ok=True)
-    cmd = conda_cmd(
-        cfg["conda_env"],
+    cmd = [
+        "python",
+        str(script),
+    ]
+    if inputs.fixed_positions:
+        positions_map = parse_fixed_positions_map(
+            inputs.fixed_positions, inputs.binder_chain
+        )
+        binder_positions = positions_map.get(inputs.binder_chain, [])
+        if binder_positions:
+            motif_contig = positions_to_contig(
+                inputs.binder_chain, binder_positions
+            )
+            cmd.extend(["--motif_contig", motif_contig])
+        else:
+            log(
+                "WARNING: No binder-chain positions found in io.inputs.fixed_positions"
+            )
+    cmd.extend(
         [
-            "python",
-            str(script),
             "--input_pdb",
             str(inputs.pdb_path),
             "--target_chain",
@@ -353,8 +465,9 @@ def run_partial_flow(
             str(cfg.get("start_t", 0.6)),
             "--samples_per_target",
             str(cfg.get("samples_per_target", 5)),
-        ],
+        ]
     )
+    cmd = conda_cmd(cfg["conda_env"], cmd)
     run_command(cmd, cwd=repo_root, dry_run=dry_run)
 
 
@@ -367,11 +480,32 @@ def run_seq_design(
     dry_run: bool,
 ):
     script = repo_root / "ProteinMPNN" / "protein_mpnn_run.py"
-    weights = repo_root / "ProteinMPNN" / "model_weights"
+    weights = Path(cfg.get("path_to_model_weights") or repo_root / "ProteinMPNN" / "model_weights")
+    model_name = cfg.get("model_name", "abmpnn")
     ensure_file(script, "ProteinMPNN runner")
     ensure_dir(weights, "ProteinMPNN weights")
     ensure_dir(paths.partial_flow_dir, "partial flow output")
-    ensure_file(inputs.fixed_positions_csv, "fixed positions CSV")
+    pdb_files = sorted(paths.partial_flow_dir.glob("*.pdb"))
+    if not pdb_files:
+        raise PipelineError(
+            f"No partial flow PDBs found in {paths.partial_flow_dir} for seq_design"
+        )
+    pdb_stems = [pdb_path.stem for pdb_path in pdb_files]
+    chain_order = []
+    for line in pdb_files[0].read_text(encoding="utf-8").splitlines():
+        if line.startswith(("ATOM", "HETATM")) and len(line) >= 22:
+            chain_id = line[21].strip()
+            if chain_id and chain_id not in chain_order:
+                chain_order.append(chain_id)
+    fixed_positions_csv = build_fixed_positions_csv(
+        paths,
+        pdb_stems,
+        "B",
+        chain_order,
+        inputs.fixed_positions,
+        default_chain=inputs.binder_chain,
+        dry_run=dry_run,
+    )
     paths.seq_dir.mkdir(parents=True, exist_ok=True)
     cmd = conda_cmd(
         cfg["conda_env"],
@@ -381,19 +515,19 @@ def run_seq_design(
             "--path_to_model_weights",
             str(weights),
             "--model_name",
-            "abmpnn",
+            str(model_name),
             "--folder_with_pdbs_path",
             str(paths.partial_flow_dir),
             "--chain_list",
-            cfg.get("chain_list", "B"),
+            "B",
             "--position_list",
-            str(inputs.fixed_positions_csv),
+            str(fixed_positions_csv),
             "--num_seq_per_target",
             str(cfg.get("num_seq_per_target", 8)),
             "--sampling_temp",
             str(cfg.get("sampling_temp", 0.1)),
             "--batch_size",
-            str(cfg.get("batch_size", 8)),
+            str(cfg.get("num_seq_per_target", 8)),
             "--out_folder",
             str(paths.seq_dir),
         ],
@@ -432,58 +566,6 @@ def parse_fasta(fasta_path: Path) -> List[Dict[str, str]]:
                 }
             )
     return records
-
-
-def run_prep_step(
-    cfg: Dict,
-    paths: DerivedPaths,
-    *,
-    dry_run: bool,
-):
-    ensure_dir(paths.partial_flow_dir, "partial flow output dir")
-    ensure_dir(paths.seq_dir, "sequence output dir")
-    if dry_run:
-        log(f"Would link PDBs from {paths.partial_flow_dir} -> {paths.link_dir}")
-    else:
-        paths.link_dir.mkdir(parents=True, exist_ok=True)
-        for pdb in sorted(paths.partial_flow_dir.glob("*.pdb")):
-            dst = paths.link_dir / pdb.name
-            if dst.exists() or dst.is_symlink():
-                dst.unlink()
-            os.symlink(pdb.resolve(), dst)
-    fasta_records: List[Dict[str, str]] = []
-    for fasta in sorted(paths.seq_dir.rglob("*.fa")):
-        fasta_records.extend(parse_fasta(fasta))
-    log(f"Found {len(fasta_records)} FASTA records")
-    if dry_run:
-        return
-    paths.fa_csv.parent.mkdir(parents=True, exist_ok=True)
-    with paths.fa_csv.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["fasta", "seq", "seq_idx"])
-        writer.writeheader()
-        for record in fasta_records:
-            writer.writerow(record)
-    drop_first = cfg.get("drop_first_seq_idx", True)
-    summary_rows: List[Dict[str, str]] = []
-    for record in fasta_records:
-        try:
-            idx_int = int(record["seq_idx"])
-        except ValueError:
-            idx_int = None
-        if drop_first and idx_int == 0:
-            continue
-        fasta_name = Path(record["fasta"]).stem
-        link_name = f"{fasta_name}.pdb"
-        summary_rows.append(
-            {"link_name": link_name, "seq": record["seq"], "seq_idx": record["seq_idx"]}
-        )
-    with paths.pf_fa_sum.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["link_name", "seq", "seq_idx"])
-        writer.writeheader()
-        writer.writerows(summary_rows)
-    log(
-        f"Wrote {len(summary_rows)} FlowPacker mapping rows to {paths.pf_fa_sum}"
-    )
 
 
 def swap_chains(input_dir: Path, output_dir: Path):
@@ -553,6 +635,48 @@ def run_flowpacker(
     *,
     dry_run: bool,
 ):
+    ensure_dir(paths.partial_flow_dir, "partial flow output dir")
+    ensure_dir(paths.seq_dir, "sequence output dir")
+    if dry_run:
+        log(f"Would link PDBs from {paths.partial_flow_dir} -> {paths.link_dir}")
+    else:
+        paths.link_dir.mkdir(parents=True, exist_ok=True)
+        for pdb in sorted(paths.partial_flow_dir.glob("*.pdb")):
+            dst = paths.link_dir / pdb.name
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            os.symlink(pdb.resolve(), dst)
+    fasta_records: List[Dict[str, str]] = []
+    for fasta in sorted(paths.seq_dir.rglob("*.fa")):
+        fasta_records.extend(parse_fasta(fasta))
+    log(f"Found {len(fasta_records)} FASTA records")
+    if dry_run:
+        return
+    paths.fa_csv.parent.mkdir(parents=True, exist_ok=True)
+    with paths.fa_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["fasta", "seq", "seq_idx"])
+        writer.writeheader()
+        for record in fasta_records:
+            writer.writerow(record)
+    drop_first = True
+    summary_rows: List[Dict[str, str]] = []
+    for record in fasta_records:
+        try:
+            idx_int = int(record["seq_idx"])
+        except ValueError:
+            idx_int = None
+        if drop_first and idx_int == 0:
+            continue
+        fasta_name = Path(record["fasta"]).stem
+        link_name = f"{fasta_name}.pdb"
+        summary_rows.append(
+            {"link_name": link_name, "seq": record["seq"], "seq_idx": record["seq_idx"]}
+        )
+    with paths.pf_fa_sum.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["link_name", "seq", "seq_idx"])
+        writer.writeheader()
+        writer.writerows(summary_rows)
+    log(f"Wrote {len(summary_rows)} FlowPacker mapping rows to {paths.pf_fa_sum}")
     scripts_dir = repo_root / "demo_scripts" / "flowpacker_af3score"
     flowpacker_repo = repo_root / "flowpacker-main"
     base_yaml_value = cfg.get("base_yaml")
@@ -571,8 +695,8 @@ def run_flowpacker(
         shutil.rmtree(chain_swap_dir)
     if dry_run:
         log(f"Would swap chains into {chain_swap_dir}")
-    else:
-        swap_chains(paths.link_dir, chain_swap_dir)
+        return
+    swap_chains(paths.link_dir, chain_swap_dir)
     flowpacker_root = paths.flowpacker_root
     batch_pdb_dir = flowpacker_root / "input_pdb_batch"
     yaml_dir = flowpacker_root / "batch_yml"
@@ -883,9 +1007,9 @@ def run_rosetta_relax(
         )
     rosetta_script = repo_root / "myscripts" / "relax_complex.py"
     ensure_file(rosetta_script, "relax_complex.py")
-    ligand_chain = str(cfg.get("ligand_chain", inputs.binder_chain))
-    receptor_chain = str(cfg.get("receptor_chain", inputs.receptor_chain))
-    fixed_chain = str(cfg.get("fixed_chain", receptor_chain))
+    ligand_chain = "B"
+    receptor_chain = "A"
+    fixed_chain = "A"
     relax_flag = str(cfg.get("relax", True))
     fix_backbone = str(cfg.get("fix_backbone", False))
     max_iter = str(cfg.get("max_iter", 170))
@@ -908,9 +1032,8 @@ def run_rosetta_relax(
             writer = csv.DictWriter(handle, fieldnames=["pdb", "ligand", "receptor"])
             writer.writeheader()
             writer.writerows(rows)
-    interface_max = float(cfg.get("interface_score_max", -8.0))
     if dry_run:
-        log("Would run PyRosetta relax/interface analysis and filter results")
+        log("Would run PyRosetta relax/interface analysis")
         return
     num_workers = str(cfg.get("num_workers", 1))
     cmd = conda_cmd(
@@ -939,7 +1062,6 @@ def run_rosetta_relax(
         ],
     )
     run_command(cmd, cwd=repo_root, dry_run=False)
-    filter_rosetta_outputs(paths, interface_max, dry_run=False)
 
 
 def convert_cif_outputs_to_pdb(src_root: Path, dst_dir: Path):
@@ -1120,6 +1242,58 @@ def filter_af3_refold_outputs(
     return linked
 
 
+def filter_af3_refold_screening(
+    paths: DerivedPaths, cfg: Dict, *, dry_run: bool
+) -> List[str]:
+    summary_path = paths.af3_refold_base_out / "screening_best_summary.csv"
+    ensure_file(summary_path, "AF3 refold summary CSV")
+    filter_cfg = cfg.get("af3_refold_filter", cfg.get("filter", {}))
+    if "filter" in cfg and "af3_refold_filter" not in cfg:
+        log("WARNING: dockq.filter is deprecated; use dockq.af3_refold_filter instead")
+    iptm_min = float(filter_cfg.get("iptm_min", 0.7))
+    plddt_min = float(filter_cfg.get("plddt_min", 70.0))
+    filtered_rows: List[Dict[str, str]] = []
+    with summary_path.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                iptm = float(row.get("iptm_peptide_vs_receptor", "nan"))
+                plddt = float(row.get("plddt_peptide_mean", "nan"))
+            except (TypeError, ValueError):
+                continue
+            if iptm >= iptm_min and plddt >= plddt_min:
+                filtered_rows.append(row)
+    log(
+        f"{len(filtered_rows)} designs pass AF3 refold thresholds iptm>= {iptm_min} & plddt>= {plddt_min}"
+    )
+    write_summary_csv(
+        paths.af3_refold_filtered_summary,
+        list(filtered_rows[0].keys()) if filtered_rows else [],
+        filtered_rows,
+        dry_run=dry_run,
+    )
+    if dry_run or not filtered_rows:
+        return [row.get("name", "") for row in filtered_rows if row.get("name")]
+    out_dir = paths.af3_refold_filtered_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for existing in out_dir.glob("*.pdb"):
+        existing.unlink()
+    linked: List[str] = []
+    for row in filtered_rows:
+        name = row.get("name") or ""
+        if not name:
+            continue
+        src = paths.af3_refold_pdb_models / f"{name}.pdb"
+        if not src.exists():
+            log(f"[pipeline] WARNING: Missing AF3 refold PDB for {name}")
+            continue
+        dst = out_dir / f"{name}.pdb"
+        safe_symlink(src.resolve(), dst)
+        linked.append(name)
+    log(f"Linked {len(linked)} AF3 refold-filtered complexes into {out_dir}")
+    return linked
+
+
 def run_dockq_evaluation(
     repo_root: Path, cfg: Dict, paths: DerivedPaths, *, dry_run: bool
 ):
@@ -1128,7 +1302,7 @@ def run_dockq_evaluation(
         log("DockQ evaluation disabled in config")
         return
     dockq_env = dockq_cfg.get("conda_env")
-    binary = dockq_cfg.get("binary", "DockQ")
+    binary = "DockQ"
     if dockq_env:
         binary_path = str(Path(binary).resolve()) if Path(binary).exists() else binary
     else:
@@ -1208,6 +1382,13 @@ def run_dockq_evaluation(
 
 
 def run_dockq_step(repo_root: Path, cfg: Dict, paths: DerivedPaths, *, dry_run: bool):
+    filtered = filter_af3_refold_screening(paths, cfg, dry_run=dry_run)
+    if not filtered:
+        log("No AF3 refold entries passed thresholds; skipping DockQ.")
+        return
+    if dry_run:
+        log("Would run DockQ evaluation after AF3 refold filtering")
+        return
     wrapper = {"dockq": cfg}
     run_dockq_evaluation(repo_root, wrapper, paths, dry_run=dry_run)
 
@@ -1247,9 +1428,15 @@ def filter_dockq_results(paths: DerivedPaths, cfg: Dict, *, dry_run: bool):
             src = paths.af3_refold_filtered_dir / f"{name}.pdb"
             if not src.exists():
                 log(f"[pipeline] WARNING: Missing AF3 refold PDB for {name}")
+            else:
+                dst = paths.final_hits_dir / f"{name}.pdb"
+                safe_symlink(src.resolve(), dst)
+            rosetta_src = paths.rosetta_filtered_dir / f"{name}.pdb"
+            if not rosetta_src.exists():
+                log(f"[pipeline] WARNING: Missing Rosetta PDB for {name}")
                 continue
-            dst = paths.final_hits_dir / f"{name}.pdb"
-            safe_symlink(src.resolve(), dst)
+            rosetta_dst = paths.final_hits_dir / f"{name}_rosetta.pdb"
+            safe_symlink(rosetta_src.resolve(), rosetta_dst)
     log(f"Final DockQ-filtered models written to {paths.final_hits_dir}")
 
 
@@ -1262,6 +1449,21 @@ def run_af3_refold(
     *,
     dry_run: bool,
 ):
+    rosetta_filter_cfg = cfg.get("rosetta_filter", {})
+    if "interface_score_max" in rosetta_cfg and "interface_score_max" not in rosetta_filter_cfg:
+        log(
+            "WARNING: rosetta_relax.interface_score_max is deprecated; "
+            "use af3_refold.rosetta_filter.interface_score_max instead"
+        )
+    interface_max = float(
+        rosetta_filter_cfg.get(
+            "interface_score_max", rosetta_cfg.get("interface_score_max", -8.0)
+        )
+    )
+    filter_rosetta_outputs(paths, interface_max, dry_run=dry_run)
+    if dry_run:
+        log("Would run AF3 refold screening after Rosetta filtering")
+        return
     ensure_dir(paths.rosetta_filtered_dir, "Rosetta-filtered PDB directory")
     rosetta_filtered = sorted(paths.rosetta_filtered_dir.glob("*.pdb"))
     if not rosetta_filtered:
@@ -1291,7 +1493,7 @@ def run_af3_refold(
         paths.af3_refold_filtered_dir.mkdir(parents=True, exist_ok=True)
         paths.dockq_results_dir.mkdir(parents=True, exist_ok=True)
         paths.final_hits_dir.mkdir(parents=True, exist_ok=True)
-    receptor_chain = str(rosetta_cfg.get("receptor_chain", inputs.receptor_chain))
+    receptor_chain = "A"
     if not base_json_value:
         if dry_run:
             log("Would generate base AF3 JSON and receptor MSA from Rosetta-filtered PDBs")
@@ -1319,7 +1521,7 @@ def run_af3_refold(
             msa_files = sorted(receptor_msa_dir.glob("*.a3m"))
             if not msa_files:
                 raise PipelineError(f"No MSA files found in {receptor_msa_dir}")
-            ligand_chain = str(rosetta_cfg.get("ligand_chain", inputs.binder_chain))
+            ligand_chain = "B"
             ligand_sequence = extract_chain_sequence(rosetta_filtered[0], ligand_chain)
             base_json = base_root / "base.json"
             num_seeds = int(cfg.get("num_seeds", 1))
@@ -1337,7 +1539,7 @@ def run_af3_refold(
                 ),
             )
     ensure_file(base_json, "base AF3 JSON")
-    ligand_chain = str(rosetta_cfg.get("ligand_chain", inputs.binder_chain))
+    ligand_chain = "B"
     peptide_fasta = paths.af3_refold_base_out / "peptide_variants.fa"
     if dry_run:
         log(f"Would write peptide FASTA to {peptide_fasta}")
@@ -1373,42 +1575,19 @@ def run_af3_refold(
     )
     run_command(cmd_screen, cwd=repo_root, dry_run=dry_run)
     if dry_run:
-        log("Would filter AF3 refold outputs and evaluate DockQ")
+        log("Would prepare AF3 refold outputs for downstream filtering")
         return
     summary_path = paths.af3_refold_base_out / "screening_best_summary.csv"
     ensure_file(summary_path, "AF3 refold summary CSV")
-    filter_cfg = cfg.get("filter", {})
-    iptm_min = float(filter_cfg.get("iptm_min", 0.7))
-    plddt_min = float(filter_cfg.get("plddt_min", 70.0))
-    filtered_rows: List[Dict[str, str]] = []
+    for existing in paths.af3_refold_pdb_models.glob("*.pdb"):
+        existing.unlink()
+    rows: List[Dict[str, str]] = []
     with summary_path.open("r", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            try:
-                iptm = float(row.get("iptm_peptide_vs_receptor", "nan"))
-                plddt = float(row.get("plddt_peptide_mean", "nan"))
-            except (TypeError, ValueError):
-                continue
-            if iptm >= iptm_min and plddt >= plddt_min:
-                filtered_rows.append(row)
-    log(
-        f"{len(filtered_rows)} designs pass AF3 refold thresholds iptm>= {iptm_min} & plddt>= {plddt_min}"
-    )
-    write_summary_csv(
-        paths.af3_refold_filtered_summary,
-        list(filtered_rows[0].keys()) if filtered_rows else [],
-        filtered_rows,
-        dry_run=False,
-    )
-    if not filtered_rows:
-        log("No AF3 refold entries passed the thresholds; skipping DockQ.")
-        return
-    for existing in paths.af3_refold_pdb_models.glob("*.pdb"):
-        existing.unlink()
-    for existing in paths.af3_refold_filtered_dir.glob("*.pdb"):
-        existing.unlink()
-    linked: List[str] = []
-    for row in filtered_rows:
+            rows.append(row)
+    converted = 0
+    for row in rows:
         name = row.get("name") or ""
         variant_dir = row.get("variant_dir")
         if not name or not variant_dir:
@@ -1420,11 +1599,10 @@ def run_af3_refold(
             continue
         dst_pdb = paths.af3_refold_pdb_models / f"{name}.pdb"
         convert_cif_to_pdb(cif_files[0], dst_pdb)
-        dst_filtered = paths.af3_refold_filtered_dir / f"{name}.pdb"
-        safe_symlink(dst_pdb.resolve(), dst_filtered)
-        linked.append(name)
-    log(f"Linked {len(linked)} AF3 refold-filtered complexes into {paths.af3_refold_filtered_dir}")
-    run_dockq_evaluation(repo_root, cfg, paths, dry_run=False)
+        converted += 1
+    log(f"Converted {converted} AF3 refold CIFs into {paths.af3_refold_pdb_models}")
+
+
 def main():
     args = parse_args()
     config_path = Path(args.config).expanduser().resolve()
@@ -1448,14 +1626,14 @@ def main():
         cwd = Path.cwd().resolve()
         inputs = InputConfig(
             pdb_path=to_path(input_cfg["pdb"], cwd),
-            fixed_positions_csv=to_path(input_cfg["fixed_positions_csv"], cwd),
             receptor_chain=str(input_cfg["receptor_chain"]),
             binder_chain=str(input_cfg["binder_chain"]),
+            fixed_positions=str(input_cfg["fixed_positions"]),
+            cdr_position=input_cfg.get("cdr_position"),
         )
     except KeyError as exc:
         raise PipelineError(f"Missing input setting: {exc}") from exc
     ensure_file(inputs.pdb_path, "input PDB")
-    ensure_file(inputs.fixed_positions_csv, "fixed positions CSV")
     sample_name = inputs.pdb_path.stem
     paths = DerivedPaths(run_root=run_root, sample_name=sample_name, receptor_chain=inputs.receptor_chain)
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -1477,9 +1655,6 @@ def main():
         ),
         "seq_design": lambda: run_seq_design(
             repo_root, step_settings["seq_design"], inputs, paths, dry_run=dry_run
-        ),
-        "prep": lambda: run_prep_step(
-            step_settings["prep"], paths, dry_run=dry_run
         ),
         "flowpacker": lambda: run_flowpacker(
             repo_root, step_settings["flowpacker"], paths, dry_run=dry_run
