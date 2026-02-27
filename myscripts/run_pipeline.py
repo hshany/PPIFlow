@@ -1007,9 +1007,9 @@ def run_rosetta_relax(
         )
     rosetta_script = repo_root / "myscripts" / "relax_complex.py"
     ensure_file(rosetta_script, "relax_complex.py")
-    ligand_chain = "B"
-    receptor_chain = "A"
-    fixed_chain = "A"
+    ligand_chain = "A"
+    receptor_chain = "B"
+    fixed_chain = "B"
     relax_flag = str(cfg.get("relax", True))
     fix_backbone = str(cfg.get("fix_backbone", False))
     max_iter = str(cfg.get("max_iter", 170))
@@ -1493,7 +1493,7 @@ def run_af3_refold(
         paths.af3_refold_filtered_dir.mkdir(parents=True, exist_ok=True)
         paths.dockq_results_dir.mkdir(parents=True, exist_ok=True)
         paths.final_hits_dir.mkdir(parents=True, exist_ok=True)
-    receptor_chain = "A"
+    receptor_chain = "B"
     if not base_json_value:
         if dry_run:
             log("Would generate base AF3 JSON and receptor MSA from Rosetta-filtered PDBs")
@@ -1521,7 +1521,7 @@ def run_af3_refold(
             msa_files = sorted(receptor_msa_dir.glob("*.a3m"))
             if not msa_files:
                 raise PipelineError(f"No MSA files found in {receptor_msa_dir}")
-            ligand_chain = "B"
+            ligand_chain = "A"
             ligand_sequence = extract_chain_sequence(rosetta_filtered[0], ligand_chain)
             base_json = base_root / "base.json"
             num_seeds = int(cfg.get("num_seeds", 1))
@@ -1539,7 +1539,7 @@ def run_af3_refold(
                 ),
             )
     ensure_file(base_json, "base AF3 JSON")
-    ligand_chain = "B"
+    ligand_chain = "A"
     peptide_fasta = paths.af3_refold_base_out / "peptide_variants.fa"
     if dry_run:
         log(f"Would write peptide FASTA to {peptide_fasta}")
