@@ -104,49 +104,56 @@ class DerivedPaths:
     def __post_init__(self):
         self.run_root.mkdir(parents=True, exist_ok=True)
 
+    def step_sample_root(self, step_name: str) -> Path:
+        return self.run_root / step_name / self.sample_name
+
+    @property
+    def partial_flow_root(self) -> Path:
+        return self.step_sample_root("partial_flow")
+
     @property
     def partial_output_root(self) -> Path:
-        return self.run_root / "output"
+        return self.partial_flow_root / "output"
 
     @property
     def partial_flow_dir(self) -> Path:
         return self.partial_output_root / f"sample_{self.sample_name}_{self.receptor_chain}"
 
     @property
+    def seq_design_root(self) -> Path:
+        return self.step_sample_root("seq_design")
+
+    @property
     def seq_dir(self) -> Path:
-        return self.run_root / "seq"
-
-    @property
-    def link_dir(self) -> Path:
-        return self.run_root / "pf" / "link_samples"
-
-    @property
-    def fa_csv(self) -> Path:
-        return self.run_root / "fa.csv"
-
-    @property
-    def pf_fa_sum(self) -> Path:
-        return self.run_root / "pf_fa_sum.csv"
+        return self.seq_design_root / "seq"
 
     @property
     def fixed_positions_csv(self) -> Path:
-        return self.run_root / "fixed_positions.csv"
-
-    @property
-    def af_root(self) -> Path:
-        return self.run_root / "af3score"
+        return self.seq_design_root / "fixed_positions.csv"
 
     @property
     def flowpacker_root(self) -> Path:
-        return self.af_root / "flowpacker"
+        return self.step_sample_root("flowpacker")
+
+    @property
+    def link_dir(self) -> Path:
+        return self.flowpacker_root / "link_samples"
+
+    @property
+    def fa_csv(self) -> Path:
+        return self.flowpacker_root / "fa.csv"
+
+    @property
+    def pf_fa_sum(self) -> Path:
+        return self.flowpacker_root / "pf_fa_sum.csv"
+
+    @property
+    def af_root(self) -> Path:
+        return self.step_sample_root("af3score")
 
     @property
     def chain_swap_dir(self) -> Path:
-        return self.af_root / "pf_link_samples_chainA"
-
-    @property
-    def logs_dir(self) -> Path:
-        return self.run_root / "logs"
+        return self.flowpacker_root / "pf_link_samples_chainA"
 
     @property
     def af3_base_out(self) -> Path:
@@ -162,7 +169,7 @@ class DerivedPaths:
 
     @property
     def rosetta_root(self) -> Path:
-        return self.run_root / "rosetta_relax"
+        return self.step_sample_root("rosetta_relax")
 
     @property
     def rosetta_inputs_csv(self) -> Path:
@@ -182,7 +189,7 @@ class DerivedPaths:
 
     @property
     def af3_refold_root(self) -> Path:
-        return self.run_root / "af3_refold"
+        return self.step_sample_root("af3_refold")
 
     @property
     def af3_refold_base_out(self) -> Path:
@@ -230,7 +237,7 @@ class DerivedPaths:
 
     @property
     def dockq_root(self) -> Path:
-        return self.run_root / "dockq"
+        return self.step_sample_root("dockq")
 
     @property
     def dockq_results_dir(self) -> Path:
@@ -242,7 +249,7 @@ class DerivedPaths:
 
     @property
     def final_hits_dir(self) -> Path:
-        return self.run_root / "final_hits"
+        return self.step_sample_root("final_hits")
 
     @property
     def final_hits_csv(self) -> Path:
@@ -250,7 +257,11 @@ class DerivedPaths:
 
     @property
     def summary_metrics_csv(self) -> Path:
-        return self.run_root / "summary_metrics.csv"
+        return self.final_hits_dir / "summary_metrics.csv"
+
+    @property
+    def flowpacker_outputs(self) -> Path:
+        return self.flowpacker_root / "flowpacker_outputs"
 
 
 def to_path(value: str, base_dir: Path) -> Path:
@@ -316,7 +327,7 @@ def create_marker(path: Path):
 
 
 def marker_path(paths: DerivedPaths, step_name: str) -> Path:
-    return paths.logs_dir / f".{step_name}.done"
+    return paths.step_sample_root(step_name) / ".done"
 
 def parse_fixed_positions_map(
     fixed_positions: str, default_chain: str
@@ -641,6 +652,13 @@ def run_flowpacker(
 ):
     ensure_dir(paths.partial_flow_dir, "partial flow output dir")
     ensure_dir(paths.seq_dir, "sequence output dir")
+    flowpacker_root = paths.flowpacker_root
+    batch_pdb_dir = flowpacker_root / "input_pdb_batch"
+    yaml_dir = flowpacker_root / "batch_yml"
+    outputs_dir = flowpacker_root / "flowpacker_outputs"
+    for directory in (batch_pdb_dir, yaml_dir, outputs_dir):
+        if directory.exists() and not dry_run:
+            shutil.rmtree(directory)
     if dry_run:
         log(f"Would link PDBs from {paths.partial_flow_dir} -> {paths.link_dir}")
     else:
@@ -701,13 +719,7 @@ def run_flowpacker(
         log(f"Would swap chains into {chain_swap_dir}")
         return
     swap_chains(paths.link_dir, chain_swap_dir)
-    flowpacker_root = paths.flowpacker_root
-    batch_pdb_dir = flowpacker_root / "input_pdb_batch"
-    yaml_dir = flowpacker_root / "batch_yml"
-    outputs_dir = flowpacker_root / "flowpacker_outputs"
     for directory in (flowpacker_root, batch_pdb_dir, yaml_dir, outputs_dir):
-        if directory.exists() and not dry_run:
-            shutil.rmtree(directory)
         if not dry_run:
             directory.mkdir(parents=True, exist_ok=True)
     split_script = scripts_dir / "1-split_batch.py"
@@ -782,7 +794,7 @@ def run_af3score(
     dry_run: bool,
 ):
     scripts_dir = repo_root / "demo_scripts" / "flowpacker_af3score"
-    flowpacker_outputs = paths.flowpacker_root / "flowpacker_outputs"
+    flowpacker_outputs = paths.flowpacker_outputs
     run_dir = flowpacker_outputs / "run_1"
     ensure_dir(scripts_dir, "FlowPacker/AF3Score scripts directory")
     ensure_dir(run_dir, "FlowPacker output (run_1)")
@@ -904,7 +916,7 @@ def filter_af3score_outputs(
     paths: DerivedPaths, iptm_min: float, ptm_min: float, *, dry_run: bool
 ) -> List[str]:
     metrics = paths.af3_base_out / "af3score_metrics.csv"
-    flowpacker_dir = paths.flowpacker_root / "flowpacker_outputs" / "run_1"
+    flowpacker_dir = paths.flowpacker_outputs / "run_1"
     ensure_file(metrics, "AF3Score metrics CSV")
     ensure_dir(flowpacker_dir, "FlowPacker outputs (run_1)")
     filtered, fieldnames = filter_metrics_by_threshold(metrics, iptm_min, ptm_min)
@@ -1633,6 +1645,112 @@ def write_final_hits_scatter_plots(paths: DerivedPaths, *, dry_run: bool):
         "scatter_af3score_iptm_vs_af3_refold_iptm.png",
     )
 
+def write_aggregate_summary(run_root: Path, sample_names: List[str], *, dry_run: bool):
+    rows: List[Dict[str, str]] = []
+    for sample in sample_names:
+        summary_path = run_root / "final_hits" / sample / "summary_metrics.csv"
+        if not summary_path.exists():
+            continue
+        with summary_path.open("r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                row = dict(row)
+                row["sample_name"] = sample
+                rows.append(row)
+    if dry_run:
+        log(f"Would write aggregate summary to {run_root / 'summary_metrics_all.csv'}")
+        return
+    if not rows:
+        log("No per-sample summary metrics found; skipping aggregate summary")
+        return
+    fieldnames = list(rows[0].keys())
+    out_path = run_root / "summary_metrics_all.csv"
+    with out_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    log(f"Wrote aggregate summary CSV to {out_path}")
+
+
+def write_aggregate_final_hits_plots(
+    run_root: Path, sample_names: List[str], *, dry_run: bool
+):
+    if dry_run:
+        log("Would generate aggregate final-hits scatter plots")
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise PipelineError(
+            "matplotlib is required to generate scatter plots (pip install matplotlib)."
+        ) from exc
+    rows: List[Dict[str, str]] = []
+    for sample in sample_names:
+        summary_path = run_root / "final_hits" / sample / "summary_metrics.csv"
+        final_hits_csv = run_root / "final_hits" / sample / "dockq_filtered.csv"
+        if not summary_path.exists() or not final_hits_csv.exists():
+            continue
+        with final_hits_csv.open("r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            final_names = {row.get("FolderName") for row in reader if row.get("FolderName")}
+        if not final_names:
+            continue
+        with summary_path.open("r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if row.get("name") in final_names:
+                    row = dict(row)
+                    row["sample_name"] = sample
+                    rows.append(row)
+    if not rows:
+        log("No aggregate final hits found; skipping aggregate plots")
+        return
+
+    def plot_scatter(x_key: str, y_key: str, title: str, filename: str):
+        xs: List[float] = []
+        ys: List[float] = []
+        for row in rows:
+            x_val = _safe_float(row.get(x_key))
+            y_val = _safe_float(row.get(y_key))
+            if x_val is None or y_val is None:
+                continue
+            xs.append(x_val)
+            ys.append(y_val)
+        if not xs:
+            log(f"No data for plot {filename}; skipping")
+            return
+        plt.figure(figsize=(6, 4.5))
+        plt.scatter(xs, ys, s=18, alpha=0.7, edgecolors="none")
+        plt.xlabel(x_key)
+        plt.ylabel(y_key)
+        plt.title(title)
+        plt.tight_layout()
+        out_dir = run_root / "final_hits" / "_aggregate"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / filename
+        plt.savefig(out_path, dpi=200)
+        plt.close()
+        log(f"Wrote aggregate plot {out_path}")
+
+    plot_scatter(
+        "af3score_iptm",
+        "rosetta_interface_score",
+        "AF3Score ipTM vs Rosetta interface score (final hits)",
+        "scatter_af3score_iptm_vs_rosetta_interface_score.png",
+    )
+    plot_scatter(
+        "af3_refold_iptm",
+        "rosetta_interface_score",
+        "AF3 refold ipTM vs Rosetta interface score (final hits)",
+        "scatter_af3_refold_iptm_vs_rosetta_interface_score.png",
+    )
+    plot_scatter(
+        "af3score_iptm",
+        "af3_refold_iptm",
+        "AF3Score ipTM vs AF3 refold ipTM (final hits)",
+        "scatter_af3score_iptm_vs_af3_refold_iptm.png",
+    )
+
 
 def run_af3_refold(
     repo_root: Path,
@@ -1813,24 +1931,44 @@ def main():
     mapping = {"repo_root": str(repo_root), "run_root": str(run_root)}
     cfg = resolve_strings(raw_cfg, mapping)
     io_cfg = cfg.get("io", {})
-    input_cfg = io_cfg.get("inputs")
-    if not input_cfg:
-        raise PipelineError("io.inputs section missing from config")
+    input_cfg = io_cfg.get("inputs", {})
+    if not isinstance(input_cfg, dict):
+        raise PipelineError("io.inputs must be a mapping when provided")
+    def get_shared_value(key: str) -> Optional[str]:
+        if key in input_cfg:
+            return input_cfg.get(key)
+        return io_cfg.get(key)
     try:
-        cwd = Path.cwd().resolve()
-        inputs = InputConfig(
-            pdb_path=to_path(input_cfg["pdb"], cwd),
-            receptor_chain=str(input_cfg["receptor_chain"]),
-            binder_chain=str(input_cfg["binder_chain"]),
-            fixed_positions=str(input_cfg["fixed_positions"]),
-            cdr_position=input_cfg.get("cdr_position"),
-        )
+        shared_receptor_chain = str(get_shared_value("receptor_chain"))
+        shared_binder_chain = str(get_shared_value("binder_chain"))
+        shared_fixed_positions = str(get_shared_value("fixed_positions"))
+        shared_cdr_position = get_shared_value("cdr_position")
     except KeyError as exc:
         raise PipelineError(f"Missing input setting: {exc}") from exc
-    ensure_file(inputs.pdb_path, "input PDB")
-    sample_name = inputs.pdb_path.stem
-    paths = DerivedPaths(run_root=run_root, sample_name=sample_name, receptor_chain=inputs.receptor_chain)
-    paths.logs_dir.mkdir(parents=True, exist_ok=True)
+    if shared_receptor_chain == "None" or shared_binder_chain == "None":
+        raise PipelineError("receptor_chain and binder_chain must be set in io.inputs or io")
+    if shared_fixed_positions == "None":
+        raise PipelineError("fixed_positions must be set in io.inputs or io")
+    cwd = Path.cwd().resolve()
+    input_dir_value = (
+        io_cfg.get("input_dir")
+        or input_cfg.get("input_dir")
+        or io_cfg.get("inputs_dir")
+        or input_cfg.get("inputs_dir")
+    )
+    pdb_paths: List[Path] = []
+    if input_dir_value:
+        input_dir = to_path(str(input_dir_value), cwd)
+        if not input_dir.is_dir():
+            raise PipelineError(f"input_dir is not a directory: {input_dir}")
+        pdb_paths = sorted(input_dir.glob("*.pdb"))
+        if not pdb_paths:
+            raise PipelineError(f"No PDB files found in input_dir: {input_dir}")
+    else:
+        pdb_value = get_shared_value("pdb")
+        if not pdb_value:
+            raise PipelineError("io.inputs.pdb must be set when input_dir is not provided")
+        pdb_paths = [to_path(str(pdb_value), cwd)]
     requested_steps: Optional[List[str]] = None
     if args.steps:
         requested_steps = [step.strip() for step in args.steps.split(",") if step.strip()]
@@ -1843,37 +1981,24 @@ def main():
     step_settings = {name: cfg.get(name, {}) for name in STEP_NAMES}
     if "dockq" in step_settings:
         step_settings["dockq"] = cfg.get("dockq", cfg.get("af3_refold", {}).get("dockq", {}))
-    step_functions = {
-        "partial_flow": lambda: run_partial_flow(
-            repo_root, step_settings["partial_flow"], inputs, paths, dry_run=dry_run
-        ),
-        "seq_design": lambda: run_seq_design(
-            repo_root, step_settings["seq_design"], inputs, paths, dry_run=dry_run
-        ),
-        "flowpacker": lambda: run_flowpacker(
-            repo_root, step_settings["flowpacker"], paths, dry_run=dry_run
-        ),
-        "af3score": lambda: run_af3score(
-            repo_root, step_settings["af3score"], paths, dry_run=dry_run
-        ),
-        "rosetta_relax": lambda: run_rosetta_relax(
-            repo_root, step_settings["rosetta_relax"], inputs, paths, dry_run=dry_run
-        ),
-        "af3_refold": lambda: run_af3_refold(
-            repo_root,
-            step_settings["af3_refold"],
-            inputs,
-            paths,
-            step_settings["rosetta_relax"],
-            dry_run=dry_run,
-        ),
-        "dockq": lambda: run_dockq_step(
-            repo_root,
-            step_settings["dockq"],
-            paths,
-            dry_run=dry_run,
-        ),
-    }
+    sample_entries: List[Tuple[InputConfig, DerivedPaths]] = []
+    for pdb_path in pdb_paths:
+        ensure_file(pdb_path, "input PDB")
+        inputs = InputConfig(
+            pdb_path=pdb_path,
+            receptor_chain=shared_receptor_chain,
+            binder_chain=shared_binder_chain,
+            fixed_positions=shared_fixed_positions,
+            cdr_position=shared_cdr_position,
+        )
+        sample_name = inputs.pdb_path.stem
+        paths = DerivedPaths(
+            run_root=run_root,
+            sample_name=sample_name,
+            receptor_chain=inputs.receptor_chain,
+        )
+        sample_entries.append((inputs, paths))
+    sample_names = [paths.sample_name for _, paths in sample_entries]
     for step in STEP_NAMES:
         settings = step_settings[step]
         enabled = settings.get("enabled")
@@ -1888,16 +2013,40 @@ def main():
             continue
         if enabled and step not in ("prep") and not env:
             raise PipelineError(f"conda_env must be set for step '{step}'")
-        marker = marker_path(paths, step)
-        if marker.exists() and not args.force:
-            log(f"Skipping {step}: marker {marker} exists (use --force to rerun)")
-            continue
-        log(f"=== Running step: {step} ===")
-        step_functions[step]()
-        if not dry_run:
-            create_marker(marker)
-    write_pipeline_summary(paths, dry_run=dry_run)
-    write_final_hits_scatter_plots(paths, dry_run=dry_run)
+        for inputs, paths in sample_entries:
+            marker = marker_path(paths, step)
+            if marker.exists() and not args.force:
+                log(f"Skipping {step} for {paths.sample_name}: marker {marker} exists (use --force to rerun)")
+                continue
+            log(f"=== Running step: {step} for {inputs.pdb_path} ===")
+            if step == "partial_flow":
+                run_partial_flow(repo_root, settings, inputs, paths, dry_run=dry_run)
+            elif step == "seq_design":
+                run_seq_design(repo_root, settings, inputs, paths, dry_run=dry_run)
+            elif step == "flowpacker":
+                run_flowpacker(repo_root, settings, paths, dry_run=dry_run)
+            elif step == "af3score":
+                run_af3score(repo_root, settings, paths, dry_run=dry_run)
+            elif step == "rosetta_relax":
+                run_rosetta_relax(repo_root, settings, inputs, paths, dry_run=dry_run)
+            elif step == "af3_refold":
+                run_af3_refold(
+                    repo_root,
+                    settings,
+                    inputs,
+                    paths,
+                    step_settings["rosetta_relax"],
+                    dry_run=dry_run,
+                )
+            elif step == "dockq":
+                run_dockq_step(repo_root, settings, paths, dry_run=dry_run)
+            if not dry_run:
+                create_marker(marker)
+    for _, paths in sample_entries:
+        write_pipeline_summary(paths, dry_run=dry_run)
+        write_final_hits_scatter_plots(paths, dry_run=dry_run)
+    write_aggregate_summary(run_root, sample_names, dry_run=dry_run)
+    write_aggregate_final_hits_plots(run_root, sample_names, dry_run=dry_run)
     log("Pipeline complete")
 
 
