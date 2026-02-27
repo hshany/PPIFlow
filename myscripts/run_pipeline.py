@@ -248,6 +248,10 @@ class DerivedPaths:
     def final_hits_csv(self) -> Path:
         return self.final_hits_dir / "dockq_filtered.csv"
 
+    @property
+    def summary_metrics_csv(self) -> Path:
+        return self.run_root / "summary_metrics.csv"
+
 
 def to_path(value: str, base_dir: Path) -> Path:
     path = Path(value).expanduser()
@@ -1440,6 +1444,196 @@ def filter_dockq_results(paths: DerivedPaths, cfg: Dict, *, dry_run: bool):
     log(f"Final DockQ-filtered models written to {paths.final_hits_dir}")
 
 
+def _safe_float(value: Optional[str]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def write_pipeline_summary(paths: DerivedPaths, *, dry_run: bool):
+    summary_rows: Dict[str, Dict[str, str]] = {}
+
+    def ensure_row(name: str) -> Dict[str, str]:
+        row = summary_rows.get(name)
+        if row is None:
+            row = {"name": name}
+            summary_rows[name] = row
+        return row
+
+    af3_metrics = paths.af3_base_out / "af3score_metrics.csv"
+    if af3_metrics.exists():
+        with af3_metrics.open("r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                name = row.get("description")
+                if not name:
+                    continue
+                entry = ensure_row(name)
+                if "iptm" in row:
+                    entry["af3score_iptm"] = row["iptm"]
+                if "ptm_A" in row:
+                    entry["af3score_ptm_A"] = row["ptm_A"]
+
+    rosetta_scores: Dict[str, float] = {}
+    if paths.rosetta_results_dir.exists():
+        csv_files = sorted(paths.rosetta_results_dir.glob("rosetta_complex_*.csv"))
+        for csv_file in csv_files:
+            with csv_file.open("r", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    name = row.get("pdb_name")
+                    score = _safe_float(row.get("interface_score"))
+                    if not name or score is None:
+                        continue
+                    current = rosetta_scores.get(name)
+                    if current is None or score < current:
+                        rosetta_scores[name] = score
+    for name, score in rosetta_scores.items():
+        entry = ensure_row(name)
+        entry["rosetta_interface_score"] = f"{score:.4f}"
+
+    af3_refold_summary = paths.af3_refold_base_out / "screening_best_summary.csv"
+    if af3_refold_summary.exists():
+        with af3_refold_summary.open("r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                name = row.get("name")
+                if not name:
+                    continue
+                entry = ensure_row(name)
+                if "iptm_peptide_vs_receptor" in row:
+                    entry["af3_refold_iptm"] = row["iptm_peptide_vs_receptor"]
+                if "plddt_peptide_mean" in row:
+                    entry["af3_refold_plddt"] = row["plddt_peptide_mean"]
+                if "ranking_score" in row:
+                    entry["af3_refold_ranking_score"] = row["ranking_score"]
+
+    dockq_summary = paths.dockq_summary_csv
+    dockq_scores: Dict[str, float] = {}
+    if dockq_summary.exists():
+        with dockq_summary.open("r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                name = row.get("FolderName")
+                overall = _safe_float(row.get("Overall_Avg_DockQ"))
+                a_avg = _safe_float(row.get("A_Participating_Avg_DockQ"))
+                if not name or (overall is None and a_avg is None):
+                    continue
+                score = a_avg if a_avg is not None else overall
+                current = dockq_scores.get(name)
+                if current is None or score > current:
+                    dockq_scores[name] = score
+    for name, a_avg in dockq_scores.items():
+        entry = ensure_row(name)
+        entry["dockq_a_avg"] = f"{a_avg:.4f}"
+
+    if dry_run:
+        log(f"Would write summary metrics CSV to {paths.summary_metrics_csv}")
+        return
+    fieldnames = [
+        "name",
+        "af3score_iptm",
+        "af3score_ptm_A",
+        "rosetta_interface_score",
+        "af3_refold_iptm",
+        "af3_refold_plddt",
+        "af3_refold_ranking_score",
+        "dockq_a_avg",
+    ]
+    paths.summary_metrics_csv.parent.mkdir(parents=True, exist_ok=True)
+    with paths.summary_metrics_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for name in sorted(summary_rows):
+            writer.writerow(summary_rows[name])
+    log(f"Wrote summary metrics CSV to {paths.summary_metrics_csv}")
+
+def write_final_hits_scatter_plots(paths: DerivedPaths, *, dry_run: bool):
+    if dry_run:
+        log("Would generate final-hits scatter plots")
+        return
+    if not paths.summary_metrics_csv.exists():
+        log(f"No summary metrics CSV found at {paths.summary_metrics_csv}; skipping plots")
+        return
+    if not paths.final_hits_csv.exists():
+        log(f"No final hits CSV found at {paths.final_hits_csv}; skipping plots")
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise PipelineError(
+            "matplotlib is required to generate scatter plots (pip install matplotlib)."
+        ) from exc
+
+    final_names: List[str] = []
+    with paths.final_hits_csv.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            name = row.get("FolderName")
+            if name:
+                final_names.append(name)
+    if not final_names:
+        log("Final hits CSV is empty; skipping plots")
+        return
+    final_set = set(final_names)
+    rows: List[Dict[str, str]] = []
+    with paths.summary_metrics_csv.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            if row.get("name") in final_set:
+                rows.append(row)
+    if not rows:
+        log("No summary metrics matched final hits; skipping plots")
+        return
+
+    def plot_scatter(x_key: str, y_key: str, title: str, filename: str):
+        xs: List[float] = []
+        ys: List[float] = []
+        for row in rows:
+            x_val = _safe_float(row.get(x_key))
+            y_val = _safe_float(row.get(y_key))
+            if x_val is None or y_val is None:
+                continue
+            xs.append(x_val)
+            ys.append(y_val)
+        if not xs:
+            log(f"No data for plot {filename}; skipping")
+            return
+        plt.figure(figsize=(6, 4.5))
+        plt.scatter(xs, ys, s=18, alpha=0.7, edgecolors="none")
+        plt.xlabel(x_key)
+        plt.ylabel(y_key)
+        plt.title(title)
+        plt.tight_layout()
+        out_path = paths.final_hits_dir / filename
+        plt.savefig(out_path, dpi=200)
+        plt.close()
+        log(f"Wrote plot {out_path}")
+
+    paths.final_hits_dir.mkdir(parents=True, exist_ok=True)
+    plot_scatter(
+        "af3score_iptm",
+        "rosetta_interface_score",
+        "AF3Score ipTM vs Rosetta interface score",
+        "scatter_af3score_iptm_vs_rosetta_interface_score.png",
+    )
+    plot_scatter(
+        "af3_refold_iptm",
+        "rosetta_interface_score",
+        "AF3 refold ipTM vs Rosetta interface score",
+        "scatter_af3_refold_iptm_vs_rosetta_interface_score.png",
+    )
+    plot_scatter(
+        "af3score_iptm",
+        "af3_refold_iptm",
+        "AF3Score ipTM vs AF3 refold ipTM",
+        "scatter_af3score_iptm_vs_af3_refold_iptm.png",
+    )
+
+
 def run_af3_refold(
     repo_root: Path,
     cfg: Dict,
@@ -1702,6 +1896,8 @@ def main():
         step_functions[step]()
         if not dry_run:
             create_marker(marker)
+    write_pipeline_summary(paths, dry_run=dry_run)
+    write_final_hits_scatter_plots(paths, dry_run=dry_run)
     log("Pipeline complete")
 
 
