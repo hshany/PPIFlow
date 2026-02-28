@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
 import os
@@ -20,6 +21,7 @@ import yaml
 
 
 STEP_NAMES = (
+    "rosetta_interface",
     "partial_flow",
     "seq_design",
     "flowpacker",
@@ -53,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--steps",
         help="Comma-separated subset of steps to run "
-        "(partial_flow,seq_design,prep,flowpacker,af3score).",
+        "(rosetta_interface,partial_flow,seq_design,flowpacker,af3score,rosetta_relax,af3_refold,dockq).",
     )
     parser.add_argument(
         "--force",
@@ -371,11 +373,13 @@ def build_fixed_positions_csv(
     chain_ids = [item for item in chain_list.split() if item]
     if not chain_ids:
         raise PipelineError("seq_design.chain_list must be provided when using fixed_positions")
-    positions_map = parse_fixed_positions_map(fixed_positions, default_chain)
-    if not positions_map:
-        raise PipelineError("No valid fixed_positions entries were parsed")
     if not chain_order:
         raise PipelineError("Unable to determine chain order for fixed_positions CSV")
+    positions_map = {}
+    if fixed_positions:
+        positions_map = parse_fixed_positions_map(fixed_positions, default_chain)
+        if not positions_map:
+            raise PipelineError("No valid fixed_positions entries were parsed")
     chain_chunks: List[str] = []
     fallback_positions: Optional[List[int]] = None
     if len(chain_ids) == 1 and positions_map:
@@ -421,6 +425,283 @@ def positions_to_contig(chain_id: str, positions: List[int]) -> str:
         else:
             parts.append(f"{chain_id}{start}-{end}")
     return ",".join(parts)
+
+
+def structure_group_name(pdb_name: str) -> str:
+    parts = pdb_name.split("_")
+    if len(parts) <= 1:
+        return pdb_name
+    return "_".join(parts[:-1])
+
+
+def chain_residue_map(pdb_path: Path, chain_id: str) -> Dict[int, str]:
+    try:
+        from Bio.PDB import PDBParser
+    except ImportError as exc:
+        raise PipelineError(
+            "Biopython is required to parse residues for motif merging "
+            "(pip install biopython)."
+        ) from exc
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure(pdb_path.stem, str(pdb_path))
+    if not structure:
+        raise PipelineError(f"Failed to parse PDB: {pdb_path}")
+    try:
+        chain = structure[0][chain_id]
+    except KeyError as exc:
+        raise PipelineError(f"Chain {chain_id} not found in {pdb_path}") from exc
+    protein_letters_3to1 = {
+        "ALA": "A",
+        "CYS": "C",
+        "ASP": "D",
+        "GLU": "E",
+        "PHE": "F",
+        "GLY": "G",
+        "HIS": "H",
+        "ILE": "I",
+        "LYS": "K",
+        "LEU": "L",
+        "MET": "M",
+        "ASN": "N",
+        "PRO": "P",
+        "GLN": "Q",
+        "ARG": "R",
+        "SER": "S",
+        "THR": "T",
+        "VAL": "V",
+        "TRP": "W",
+        "TYR": "Y",
+        "MSE": "M",
+    }
+    mapping: Dict[int, str] = {}
+    for residue in chain:
+        if residue.id[0] != " ":
+            continue
+        resnum = int(residue.id[1])
+        resname = residue.get_resname().upper()
+        mapping[resnum] = protein_letters_3to1.get(resname, "X")
+    return mapping
+
+
+def merge_motif_pdb(
+    pdb_path: Path,
+    output_path: Path,
+    *,
+    binder_chain: str,
+    key_res: Dict[int, str],
+    renumber_chain: Optional[str] = None,
+    renumber_start: int = 1,
+):
+    one_to_three = {
+        "A": "ALA",
+        "R": "ARG",
+        "N": "ASN",
+        "D": "ASP",
+        "C": "CYS",
+        "Q": "GLN",
+        "E": "GLU",
+        "G": "GLY",
+        "H": "HIS",
+        "I": "ILE",
+        "L": "LEU",
+        "K": "LYS",
+        "M": "MET",
+        "F": "PHE",
+        "P": "PRO",
+        "S": "SER",
+        "T": "THR",
+        "W": "TRP",
+        "Y": "TYR",
+        "V": "VAL",
+        "X": "UNK",
+    }
+    lines = pdb_path.read_text(encoding="utf-8").splitlines()
+    output_lines: List[str] = []
+    current_renumber_idx = renumber_start - 1
+    last_seen_resi = None
+    for line in lines:
+        if not line.startswith("ATOM"):
+            output_lines.append(line)
+            continue
+        chain_id = line[21]
+        if chain_id == binder_chain:
+            resi = int(line[22:26])
+            if resi in key_res:
+                resname = one_to_three.get(key_res[resi], "UNK")
+                line = f"{line[:17]}{resname:<3}{line[20:]}"
+        elif renumber_chain and chain_id == renumber_chain:
+            current_resi_id = line[22:27]
+            if current_resi_id != last_seen_resi:
+                current_renumber_idx += 1
+                last_seen_resi = current_resi_id
+            new_resi_str = f"{current_renumber_idx:>4}"
+            line = f"{line[:22]}{new_resi_str} {line[27:]}"
+        output_lines.append(line)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+
+
+def run_rosetta_interface_preprocess(
+    repo_root: Path,
+    cfg: Dict,
+    input_dir: Path,
+    binder_chain: str,
+    receptor_chain: str,
+    run_root: Path,
+    *,
+    dry_run: bool,
+) -> Tuple[Path, Dict[str, str]]:
+    rosetta_cfg = cfg.get("rosetta_interface", {})
+    output_root = run_root / "rosetta_interface"
+    rosetta_out_dir = output_root / "rosetta_outputs"
+    analysis_dir = output_root / "analysis"
+    merge_dir = output_root / "merge_motif_pdb"
+    marker = output_root / ".done"
+    if marker.exists() and not dry_run:
+        log(f"Skipping rosetta_interface: marker {marker} exists (use --force to rerun)")
+    else:
+        if dry_run:
+            log(f"Would run rosetta interface analysis for {input_dir}")
+        else:
+            output_root.mkdir(parents=True, exist_ok=True)
+            rosetta_out_dir.mkdir(parents=True, exist_ok=True)
+            analysis_dir.mkdir(parents=True, exist_ok=True)
+            merge_dir.mkdir(parents=True, exist_ok=True)
+        run_script = rosetta_cfg.get("run_script")
+        if run_script:
+            run_script_path = Path(run_script)
+            ensure_file(run_script_path, "rosetta interface run_script")
+            cmd = ["bash", str(run_script_path), str(input_dir), str(rosetta_out_dir)]
+            run_command(cmd, cwd=repo_root, dry_run=dry_run)
+        get_energy_script = rosetta_cfg.get("energy_script") or (
+            repo_root / "demo_scripts" / "interface_analysis" / "get_interface_energy.py"
+        )
+        ensure_file(Path(get_energy_script), "interface energy script")
+        interface_dist = float(rosetta_cfg.get("interface_dist", 12.0))
+        cmd_energy = conda_cmd(
+            rosetta_cfg["conda_env"],
+            [
+                "python",
+                str(get_energy_script),
+                "--input_pdbdir",
+                str(input_dir),
+                "--rosetta_dir",
+                str(rosetta_out_dir),
+                "--binder_id",
+                binder_chain,
+                "--target_id",
+                receptor_chain,
+                "--output_dir",
+                str(analysis_dir),
+                "--interface_dist",
+                str(interface_dist),
+            ],
+        )
+        run_command(cmd_energy, cwd=repo_root, dry_run=dry_run)
+        if not dry_run:
+            create_marker(marker)
+    if dry_run:
+        return input_dir, {}
+
+    residue_energy_csv = analysis_dir / "residue_energy.csv"
+    ensure_file(residue_energy_csv, "residue energy CSV")
+    energy_cutoff = float(rosetta_cfg.get("energy_cutoff", -5.0))
+    renumber_chain = rosetta_cfg.get("renumber_chain")
+    renumber_start = int(rosetta_cfg.get("renumber_start", 1))
+    fallback_fixed = rosetta_cfg.get("fallback_fixed_positions", "")
+    per_pdb_records: List[Dict[str, str]] = []
+    group_entries: Dict[str, List[Dict[str, str]]] = {}
+    with residue_energy_csv.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            per_pdb_records.append(row)
+            pdb_name = row.get("pdbname") or ""
+            if not pdb_name:
+                continue
+            group = structure_group_name(pdb_name)
+            group_entries.setdefault(group, []).append(row)
+
+    fixed_positions_map: Dict[str, str] = {}
+    fixed_residue_rows: List[Dict[str, str]] = []
+    for group, rows in sorted(group_entries.items()):
+        key_res: Dict[int, Tuple[float, str]] = {}
+        base_pdb_path: Optional[Path] = None
+        for row in rows:
+            pdb_path = row.get("pdbpath")
+            if pdb_path and base_pdb_path is None:
+                base_pdb_path = Path(pdb_path)
+            binder_energy_str = row.get("binder_energy") or "{}"
+            try:
+                binder_energy = ast.literal_eval(binder_energy_str)
+            except (ValueError, SyntaxError):
+                binder_energy = {}
+            if not pdb_path:
+                continue
+            try:
+                residue_map = chain_residue_map(Path(pdb_path), binder_chain)
+            except PipelineError as exc:
+                log(f"WARNING: {exc}")
+                continue
+            for resnum_str, energy in binder_energy.items():
+                try:
+                    resnum = int(resnum_str)
+                    energy_val = float(energy)
+                except (TypeError, ValueError):
+                    continue
+                if energy_val >= energy_cutoff:
+                    continue
+                aa = residue_map.get(resnum, "X")
+                current = key_res.get(resnum)
+                if current is None or energy_val < current[0]:
+                    key_res[resnum] = (energy_val, aa)
+        if base_pdb_path is None:
+            log(f"WARNING: No PDB paths found for group {group}, skipping merge")
+            continue
+        fixed_positions = ",".join(
+            f"{binder_chain}{resnum}" for resnum in sorted(key_res.keys())
+        )
+        if not fixed_positions and fallback_fixed:
+            fixed_positions = str(fallback_fixed)
+        fixed_positions_map[group] = fixed_positions
+        fixed_residue_rows.append(
+            {
+                "pdb_path": str(base_pdb_path),
+                "pdb_name": group,
+                "target_id": receptor_chain,
+                "binder_id": binder_chain,
+                "key_res": str({k: [v[0], v[1]] for k, v in key_res.items()}),
+                "num_fixed_residues": str(len(key_res)),
+            }
+        )
+        key_res_aa = {resnum: val[1] for resnum, val in key_res.items()}
+        merged_pdb = merge_dir / f"{group}.pdb"
+        if not dry_run:
+            merge_motif_pdb(
+                base_pdb_path,
+                merged_pdb,
+                binder_chain=binder_chain,
+                key_res=key_res_aa,
+                renumber_chain=renumber_chain,
+                renumber_start=renumber_start,
+            )
+    if not dry_run:
+        fixed_residue_csv = analysis_dir / "fixed_residue.csv"
+        with fixed_residue_csv.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "pdb_path",
+                    "pdb_name",
+                    "target_id",
+                    "binder_id",
+                    "key_res",
+                    "num_fixed_residues",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(fixed_residue_rows)
+        log(f"Wrote fixed residue summary to {fixed_residue_csv}")
+    return merge_dir, fixed_positions_map
 
 
 def run_partial_flow(
@@ -1941,14 +2222,24 @@ def main():
     try:
         shared_receptor_chain = str(get_shared_value("receptor_chain"))
         shared_binder_chain = str(get_shared_value("binder_chain"))
-        shared_fixed_positions = str(get_shared_value("fixed_positions"))
+        fixed_positions_value = get_shared_value("fixed_positions")
+        shared_fixed_positions = str(fixed_positions_value) if fixed_positions_value is not None else ""
         shared_cdr_position = get_shared_value("cdr_position")
     except KeyError as exc:
         raise PipelineError(f"Missing input setting: {exc}") from exc
     if shared_receptor_chain == "None" or shared_binder_chain == "None":
         raise PipelineError("receptor_chain and binder_chain must be set in io.inputs or io")
-    if shared_fixed_positions == "None":
-        raise PipelineError("fixed_positions must be set in io.inputs or io")
+    rosetta_interface_cfg = cfg.get("rosetta_interface", {})
+    fixed_mode = (
+        get_shared_value("fixed_positions_mode")
+        or rosetta_interface_cfg.get("mode")
+        or ("rosetta_energy" if rosetta_interface_cfg.get("energy_cutoff") is not None else "explicit")
+    )
+    if fixed_mode not in ("explicit", "rosetta_energy"):
+        raise PipelineError(f"Unknown fixed_positions_mode '{fixed_mode}'")
+    if fixed_mode == "explicit":
+        if not shared_fixed_positions or shared_fixed_positions == "None":
+            raise PipelineError("fixed_positions must be set in io.inputs or io")
     cwd = Path.cwd().resolve()
     input_dir_value = (
         io_cfg.get("input_dir")
@@ -1957,6 +2248,7 @@ def main():
         or input_cfg.get("inputs_dir")
     )
     pdb_paths: List[Path] = []
+    input_dir: Optional[Path] = None
     if input_dir_value:
         input_dir = to_path(str(input_dir_value), cwd)
         if not input_dir.is_dir():
@@ -1981,14 +2273,45 @@ def main():
     step_settings = {name: cfg.get(name, {}) for name in STEP_NAMES}
     if "dockq" in step_settings:
         step_settings["dockq"] = cfg.get("dockq", cfg.get("af3_refold", {}).get("dockq", {}))
+    if fixed_mode == "rosetta_energy":
+        if not input_dir:
+            raise PipelineError("input_dir must be provided when fixed_positions_mode=rosetta_energy")
+        if "rosetta_interface" not in step_settings:
+            step_settings["rosetta_interface"] = rosetta_interface_cfg
+        if rosetta_interface_cfg.get("enabled") is False:
+            raise PipelineError("rosetta_interface.enabled=false but fixed_positions_mode=rosetta_energy")
+        interface_env = step_settings["rosetta_interface"].get("conda_env")
+        if not interface_env:
+            raise PipelineError("rosetta_interface.conda_env must be set for rosetta_energy mode")
+        merged_dir, fixed_positions_by_group = run_rosetta_interface_preprocess(
+            repo_root,
+            cfg,
+            input_dir,
+            shared_binder_chain,
+            shared_receptor_chain,
+            run_root,
+            dry_run=dry_run,
+        )
+        pdb_paths = sorted(merged_dir.glob("*.pdb"))
+        if not pdb_paths:
+            raise PipelineError(f"No merged PDBs found in {merged_dir}")
     sample_entries: List[Tuple[InputConfig, DerivedPaths]] = []
     for pdb_path in pdb_paths:
         ensure_file(pdb_path, "input PDB")
+        fixed_positions = shared_fixed_positions
+        if fixed_mode == "rosetta_energy":
+            group_name = pdb_path.stem
+            fixed_positions = fixed_positions_by_group.get(group_name, "")
+            if not fixed_positions:
+                log(
+                    f"WARNING: No fixed positions found for {group_name}; "
+                    "downstream steps may require fixed_positions."
+                )
         inputs = InputConfig(
             pdb_path=pdb_path,
             receptor_chain=shared_receptor_chain,
             binder_chain=shared_binder_chain,
-            fixed_positions=shared_fixed_positions,
+            fixed_positions=fixed_positions,
             cdr_position=shared_cdr_position,
         )
         sample_name = inputs.pdb_path.stem
@@ -2000,6 +2323,12 @@ def main():
         sample_entries.append((inputs, paths))
     sample_names = [paths.sample_name for _, paths in sample_entries]
     for step in STEP_NAMES:
+        if step == "rosetta_interface":
+            if fixed_mode == "rosetta_energy":
+                log("Skipping rosetta_interface step: handled during preprocessing")
+            else:
+                log("Skipping rosetta_interface step: fixed_positions_mode=explicit")
+            continue
         settings = step_settings[step]
         enabled = settings.get("enabled")
         if enabled is None:
