@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, TextIO, Tuple
@@ -434,6 +435,140 @@ def structure_group_name(pdb_name: str) -> str:
     return "_".join(parts[:-1])
 
 
+def parse_chain_ranges(pdb_path: Path) -> Dict[str, Tuple[int, int]]:
+    chains: Dict[str, Tuple[int, int]] = {}
+    with pdb_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.startswith("ATOM"):
+                continue
+            if len(line) < 26:
+                continue
+            chain_id = line[21].strip()
+            if not chain_id:
+                continue
+            try:
+                res_seq = int(line[22:26].strip())
+            except ValueError:
+                continue
+            if chain_id not in chains:
+                chains[chain_id] = (res_seq, res_seq)
+            else:
+                start, end = chains[chain_id]
+                if res_seq < start:
+                    start = res_seq
+                if res_seq > end:
+                    end = res_seq
+                chains[chain_id] = (start, end)
+    if not chains:
+        raise PipelineError(f"No ATOM records found in {pdb_path}")
+    return chains
+
+
+def update_xml_template(xml_template: Path, pdb_path: Path, output_path: Path):
+    chains = parse_chain_ranges(pdb_path)
+    resnums = ",".join(
+        f"{start}{chain}-{end}{chain}" for chain, (start, end) in chains.items()
+    )
+    content = xml_template.read_text(encoding="utf-8")
+    updated = re.sub(r'resnums="[^"]+"', f'resnums="{resnums}"', content)
+    output_path.write_text(updated, encoding="utf-8")
+
+
+def get_cb_or_ca(residue):
+    if "CB" in residue:
+        return residue["CB"].coord
+    if "CA" in residue:
+        return residue["CA"].coord
+    return None
+
+
+def residue_pairs_within_distance(
+    pdb_path: Path, binder_chain: str, target_chain: str, distance_threshold: float
+) -> set[Tuple[int, int]]:
+    try:
+        from Bio.PDB import PDBParser
+    except ImportError as exc:
+        raise PipelineError(
+            "Biopython is required to compute interface distances "
+            "(pip install biopython)."
+        ) from exc
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure(pdb_path.stem, str(pdb_path))
+    model = structure[0]
+    try:
+        binder = model[binder_chain]
+        target = model[target_chain]
+    except KeyError as exc:
+        raise PipelineError(f"Chain {exc} not found in {pdb_path}") from exc
+    threshold_sq = distance_threshold * distance_threshold
+    pairs: set[Tuple[int, int]] = set()
+    for res1 in binder:
+        coord1 = get_cb_or_ca(res1)
+        if coord1 is None:
+            continue
+        for res2 in target:
+            coord2 = get_cb_or_ca(res2)
+            if coord2 is None:
+                continue
+            dx = coord1[0] - coord2[0]
+            dy = coord1[1] - coord2[1]
+            dz = coord1[2] - coord2[2]
+            if dx * dx + dy * dy + dz * dz <= threshold_sq:
+                pairs.add((int(res1.id[1]), int(res2.id[1])))
+    return pairs
+
+
+def parse_rosetta_residue_pairs(
+    logfile: Path, binder_chain: str, target_chain: str
+) -> List[Tuple[int, int, float]]:
+    if not logfile.exists():
+        return []
+    lines: List[List[str]] = []
+    with logfile.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.rstrip("\n").startswith("ResResE"):
+                lines.append(line.split())
+    if len(lines) < 3:
+        return []
+    header = lines[0]
+    rows = lines[2:]
+    try:
+        res1_idx = header.index("Res1")
+        res2_idx = header.index("Res2")
+        total_idx = header.index("total")
+    except ValueError:
+        return []
+    chain_map = {str(i): chr(i) for i in list(range(65, 91)) + list(range(97, 123))}
+    parsed: List[Tuple[int, int, float]] = []
+    for row in rows:
+        if len(row) <= max(res1_idx, res2_idx, total_idx):
+            continue
+        res1 = row[res1_idx]
+        res2 = row[res2_idx]
+        total_str = row[total_idx]
+        if "_" not in res1 or "_" not in res2:
+            continue
+        res1_part = res1.split("_", 1)[1]
+        res2_part = res2.split("_", 1)[1]
+        if len(res1_part) < 3 or len(res2_part) < 3:
+            continue
+        chain1 = chain_map.get(res1_part[:2])
+        chain2 = chain_map.get(res2_part[:2])
+        if not chain1 or not chain2:
+            continue
+        try:
+            resnum1 = int(res1_part[2:])
+            resnum2 = int(res2_part[2:])
+            total = float(total_str)
+        except ValueError:
+            continue
+        if chain1 == binder_chain and chain2 == target_chain:
+            parsed.append((resnum1, resnum2, total))
+        elif chain1 == target_chain and chain2 == binder_chain:
+            parsed.append((resnum2, resnum1, total))
+    return parsed
+
+
 def chain_residue_map(pdb_path: Path, chain_id: str) -> Dict[int, str]:
     try:
         from Bio.PDB import PDBParser
@@ -567,37 +702,110 @@ def run_rosetta_interface_preprocess(
             rosetta_out_dir.mkdir(parents=True, exist_ok=True)
             analysis_dir.mkdir(parents=True, exist_ok=True)
             merge_dir.mkdir(parents=True, exist_ok=True)
-        run_script = rosetta_cfg.get("run_script")
-        if run_script:
-            run_script_path = Path(run_script)
-            ensure_file(run_script_path, "rosetta interface run_script")
-            cmd = ["bash", str(run_script_path), str(input_dir), str(rosetta_out_dir)]
-            run_command(cmd, cwd=repo_root, dry_run=dry_run)
-        get_energy_script = rosetta_cfg.get("energy_script") or (
-            repo_root / "demo_scripts" / "interface_analysis" / "get_interface_energy.py"
+        rosetta_bin = rosetta_cfg.get("rosetta_bin") or (
+            "/home/hehuang/soft_shared/rosetta.binary.linux.release-371/main/source/"
+            "build/src/release/linux/5.4/64/x86/gcc/4.8/static/"
+            "rosetta_scripts.static.linuxgccrelease"
         )
-        ensure_file(Path(get_energy_script), "interface energy script")
+        rosetta_bin_path = shutil.which(str(rosetta_bin)) or str(rosetta_bin)
+        if not Path(rosetta_bin_path).exists():
+            raise PipelineError(
+                f"Rosetta binary not found at '{rosetta_bin}'. "
+                "Set rosetta_interface.rosetta_bin to the full path."
+            )
+        xml_template = Path(
+            rosetta_cfg.get("xml_template")
+            or repo_root / "demo_scripts" / "interface_analysis" / "codes" / "native.xml"
+        )
+        ensure_file(xml_template, "rosetta interface XML template")
+        pdb_files = sorted(input_dir.glob("*.pdb"))
+        if not pdb_files:
+            raise PipelineError(f"No PDB files found in input_dir: {input_dir}")
+        num_workers = int(rosetta_cfg.get("num_workers", 0))
+        max_workers = os.cpu_count() if num_workers <= 0 else num_workers
+
+        def run_single_rosetta(pdb_path: Path):
+            pdb_name = pdb_path.stem
+            job_dir = rosetta_out_dir / pdb_name
+            out_dir = job_dir / "out"
+            if out_dir.exists() and not dry_run:
+                shutil.rmtree(out_dir)
+            if dry_run:
+                log(f"Would run Rosetta interface analysis for {pdb_name}")
+                return
+            out_dir.mkdir(parents=True, exist_ok=True)
+            local_pdb = job_dir / f"{pdb_name}.pdb"
+            shutil.copy2(pdb_path, local_pdb)
+            xml_path = job_dir / "update.xml"
+            update_xml_template(xml_template, local_pdb, xml_path)
+            out_path = out_dir / f"{pdb_name}.out"
+            cmd = [
+                str(rosetta_bin_path),
+                "-parser:protocol",
+                str(xml_path),
+                "-s",
+                str(local_pdb),
+                "-overwrite",
+                "-ignore_zero_occupancy",
+                "false",
+            ]
+            with out_path.open("w", encoding="utf-8") as handle:
+                run_command(cmd, cwd=repo_root, dry_run=False, stdout=handle)
+
+        if dry_run or max_workers == 1 or len(pdb_files) == 1:
+            for pdb_path in pdb_files:
+                run_single_rosetta(pdb_path)
+        else:
+            log(f"Running Rosetta interface analysis with {max_workers} workers")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(run_single_rosetta, pdb_path) for pdb_path in pdb_files]
+                for future in as_completed(futures):
+                    future.result()
         interface_dist = float(rosetta_cfg.get("interface_dist", 12.0))
-        cmd_energy = conda_cmd(
-            rosetta_cfg["conda_env"],
-            [
-                "python",
-                str(get_energy_script),
-                "--input_pdbdir",
-                str(input_dir),
-                "--rosetta_dir",
-                str(rosetta_out_dir),
-                "--binder_id",
-                binder_chain,
-                "--target_id",
-                receptor_chain,
-                "--output_dir",
-                str(analysis_dir),
-                "--interface_dist",
-                str(interface_dist),
-            ],
-        )
-        run_command(cmd_energy, cwd=repo_root, dry_run=dry_run)
+        if not dry_run:
+            rows: List[Dict[str, str]] = []
+            for pdb_path in pdb_files:
+                pdb_name = pdb_path.stem
+                logfile = rosetta_out_dir / pdb_name / "out" / f"{pdb_name}.out"
+                interface_pairs = residue_pairs_within_distance(
+                    pdb_path, binder_chain, receptor_chain, interface_dist
+                )
+                interactions = parse_rosetta_residue_pairs(
+                    logfile, binder_chain, receptor_chain
+                )
+                binder_energy: Dict[int, float] = {}
+                for bind_res, target_res, total in interactions:
+                    if total >= 0:
+                        continue
+                    if (bind_res, target_res) not in interface_pairs:
+                        continue
+                    binder_energy[bind_res] = binder_energy.get(bind_res, 0.0) + total
+                rows.append(
+                    {
+                        "pdbpath": str(pdb_path),
+                        "pdbname": pdb_name,
+                        "rosetta_path": str(logfile),
+                        "target_id": receptor_chain,
+                        "binder_id": binder_chain,
+                        "binder_energy": str(binder_energy),
+                    }
+                )
+            analysis_dir.mkdir(parents=True, exist_ok=True)
+            residue_energy_csv = analysis_dir / "residue_energy.csv"
+            with residue_energy_csv.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "pdbpath",
+                        "pdbname",
+                        "rosetta_path",
+                        "target_id",
+                        "binder_id",
+                        "binder_energy",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(rows)
         if not dry_run:
             create_marker(marker)
     if dry_run:
